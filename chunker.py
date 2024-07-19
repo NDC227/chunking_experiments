@@ -16,9 +16,11 @@ import torch
 import torch.nn as nn
 import lightning as L
 from tqdm import tqdm
+from huggingface_hub import PyTorchModelHubMixin
 
 from fast_bm25 import BM25
 
+os.environ["HF_TOKEN"] = "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"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class DocWrapper(object):
@@ -30,7 +32,7 @@ docs = [DocWrapper(ex) for ex in ds['train']]
 # print(docs[:10])
 # print(docs[0].page_content)
 
-if not os.path.isfile('data/chunks.json'):
+if not os.path.isfile('data/train_chunks_with_retrieve.json'):
     def get_splits(splitter, data):
         return [split.page_content for split in splitter.split_documents(docs)]
 
@@ -63,8 +65,8 @@ if not os.path.isfile('data/chunks.json'):
 
     all_splits, all_ids = [], []
     splitters = [rec_char_splitter, rec_char_splitter_2, token_splitter, char_splitter, nltk_splitter, \
-                sentence_transformer_splitter]
-    splitters = [rec_char_splitter, token_splitter]
+                sentence_transformer_splitter, spacy_splitter, semantic_chunker]
+    # splitters = [rec_char_splitter, token_splitter]
     for splitter in splitters:
         if splitter.__class__.__name__ != 'SemanticChunker':
             print(f'{splitter.__class__.__name__}_{splitter._chunk_size}_{splitter._chunk_overlap}')
@@ -76,59 +78,68 @@ if not os.path.isfile('data/chunks.json'):
     
     df = pd.DataFrame.from_dict({'chunk': all_splits, 'id': all_ids})
     df.to_json('data/chunks.json')
+
+    tokenized_splits = [x.split() for x in all_splits]
+    bm25 = BM25(tokenized_splits)
+
+    def retrieve_from_query(query, k):
+        tokenized_query = query.split()
+        retrieve = bm25.get_top_n(tokenized_query, tokenized_splits, n=k)
+        retrieved_docs = [' '.join(x) for x in retrieve]
+        return retrieved_docs
+
+
+    # Now pass the retrieval results to the LLM (basically, RAG with frozen components)
+
+    # Baseline: deduplicate retrieval results somehow
+
+    # The neural net we train:
+    # - For each question:
+    #    - Encode each chunk and output a score (how to encode?)
+    #    - Turn all scores over all chunks into a distribution P(d|q)
+    #    - For each chunk get the NLL of the correct answer as another distribution Q(d|q) (from a RAG 'open domain QA' dataset; use HF transformers to get the NLL)
+    #    - Minimize the KL div of those two distributions (KL_div(P||Q)) (https://arxiv.org/abs/2301.12652 - REPLUG)
+    # - Add loss term for the length of the sequence (number of tokens)
+    # - Train
+
+    # For (fast) BM25
+    def add_retrieval_results(ex):
+        ex['retrieved'] = retrieve_from_query(ex['questions'][0]['input_text'], k=10)
+        # one alternative here for speed could be to not use Chroma but some kind of sparse search like Elastic
+        return ex
+
+    # Data pre-processing (tokenize and de-nesting)
+    def preprocess(ex):
+        ex['questions'] = ex['questions'][0]['input_text']
+        ex['answers'] = ex['answers'][0]['span_text']
+        return ex
+
+    train_dataset = Dataset.from_dict(ds['train'][:])
+    train_dataset = train_dataset.map(add_retrieval_results)
+    train_dataset = train_dataset.map(preprocess)
+    train_dataset = train_dataset.remove_columns(['contexts', 'has_correct_context', 'name', 'id'])
+
+    valid_dataset = Dataset.from_dict(ds['validation'][:])
+    valid_dataset = valid_dataset.map(add_retrieval_results)
+    valid_dataset = valid_dataset.map(preprocess)
+
+    train_dataset.to_json("data/train_chunks_with_retrieve.json")
+    valid_dataset.to_json("data/valid_chunks_with_retrieve.json")
 else:
-    df = pd.read_json('data/chunks.json')
-    all_splits = list(df['chunk'].values)
-    all_ids = list(df['id'].values)
+    train_dataset = load_dataset("json", data_files="data/train_chunks_with_retrieve.json")['train']
+    valid_dataset = load_dataset("json", data_files="data/valid_chunks_with_retrieve.json")['train']
 
-tokenized_splits = [x.split() for x in all_splits]
-bm25 = BM25(tokenized_splits)
+TINY = False
+if TINY:
+    train_dataset = Dataset.from_dict(train_dataset[:20])
+    valid_dataset = Dataset.from_dict(valid_dataset[:20])
 
-def retrieve_from_query(query, k):
-    tokenized_query = query.split()
-    retrieve = bm25.get_top_n(tokenized_query, tokenized_splits, n=k)
-    retrieved_docs = [' '.join(x) for x in retrieve]
-    return retrieved_docs
-
-batch_size = 4
+batch_size = 8
 model_id = 'facebook/opt-125m'
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-# Now pass the retrieval results to the LLM (basically, RAG with frozen components)
-
-# Baseline: deduplicate retrieval results somehow
-
-# The neural net we train:
-# - For each question:
-#    - Encode each chunk and output a score (how to encode?)
-#    - Turn all scores over all chunks into a distribution P(d|q)
-#    - For each chunk get the NLL of the correct answer as another distribution Q(d|q) (from a RAG 'open domain QA' dataset; use HF transformers to get the NLL)
-#    - Minimize the KL div of those two distributions (KL_div(P||Q)) (https://arxiv.org/abs/2301.12652 - REPLUG)
-# - Add loss term for the length of the sequence (number of tokens)
-# - Train
-
-# For (fast) BM25
-def add_retrieval_results(ex):
-    ex['retrieved'] = retrieve_from_query(ex['questions'][0]['input_text'], k=10)
-    # one alternative here for speed could be to not use Chroma but some kind of sparse search like Elastic
-    return ex
-
-# Data pre-processing (tokenize and de-nesting)
-def preprocess(ex):
-    ex['questions'] = ex['questions'][0]['input_text']
-    ex['answers'] = ex['answers'][0]['span_text']
-    return ex
-
-tiny_train_dataset = Dataset.from_dict(ds['train'][:])
-tiny_train_dataset = tiny_train_dataset.map(add_retrieval_results)
-tiny_train_dataset = tiny_train_dataset.map(preprocess)
-tiny_train_dataset = tiny_train_dataset.remove_columns(['contexts', 'has_correct_context', 'name', 'id'])
-tiny_train_loader = DataLoader(tiny_train_dataset, batch_size=batch_size, shuffle=True)
-
-tiny_valid_dataset = Dataset.from_dict(ds['validation'][:])
-tiny_valid_dataset = tiny_valid_dataset.map(add_retrieval_results)
-tiny_valid_dataset = tiny_valid_dataset.map(preprocess)
-tiny_valid_loader = DataLoader(tiny_valid_dataset, batch_size=batch_size, shuffle=True)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True)
 
 # train_dataset = ds['train'].map(add_retrieval_results)
 # train_dataset = train_dataset.map(tokenize)
@@ -166,8 +177,8 @@ class Encoder(nn.Module):
         self.encoding_block = nn.TransformerEncoder(self.encoding_layer, num_layers=self.n_layers)
 
     def forward(self, input, mask):
-        print(input.device)
-        print(next(self.embedding.parameters()).device)
+        # print(input.device)
+        # print(next(self.embedding.parameters()).device)
         x = self.embedding(input)
         x = self.encoding_block(x, src_key_padding_mask=mask)
         # x = self.encoding_block(x)
@@ -175,43 +186,43 @@ class Encoder(nn.Module):
         return x
 
 # TODO by Andrew: fill in the rest from here: https://lightning.ai/docs/pytorch/stable/common/lightning_module.html
-class ReplugTransformer(L.LightningModule):
+class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
     def __init__(self, vocab_size):
         super().__init__()
         # self.encoder = Transformer(vocab_size=vocab_size)
-        self.encoder = Encoder(vocab_size)
-        self.llm = llm_model  # LLM to get NLLs for reference distribution in KL div #TODO: separate 
+        self.query_encoder = Encoder(vocab_size)
+        self.docs_encoder = Encoder(vocab_size)
+        self.llm = llm_model  # LLM to get NLLs for reference distribution in KL div 
         for param in self.llm.parameters():
             param.requires_grad = False
     
     def forward(self, questions, docs):
-        questions, questions_mask = questions['input_ids'], torch.logical_not(questions['attention_mask'].to(dtype=torch.bool))
-        docs, docs_mask = docs['input_ids'], torch.logical_not(docs['attention_mask'].to(dtype=torch.bool))
+        questions_input, questions_mask = questions['input_ids'], torch.logical_not(questions['attention_mask'].to(dtype=torch.bool))
+        docs_input, docs_mask = docs['input_ids'], torch.logical_not(docs['attention_mask'].to(dtype=torch.bool))
         # Encode questions and documents
-        print('questions', questions)
+        # print('questions', questions)
         # print(len(docs), questions.shape, docs[0].shape)
-        print('docs', docs.shape, docs)
-        n_examples = questions.shape[0]
-        q_emb = self.encoder(questions, questions_mask)
-        print('q_emb', q_emb.shape, q_emb)
+        # print('docs', docs.shape, docs)
+        n_examples = questions_input.shape[0]
+        q_emb = self.query_encoder(questions_input, questions_mask)
+        # print('q_emb', q_emb.shape, q_emb)
         # Squeeze and unsqueeze to pass batch of retrievals into encoder at once?
         # Turn B x K x L to (BK) x L
-        B, K, L = docs.shape
-        print(B, K, L)
-        input_docs = torch.reshape(docs, (B * K, L))
-        input_docs_mask = torch.reshape(docs_mask, (B*K, -1))
-        print(input_docs.shape)
-        d_embs = self.encoder(input_docs, input_docs_mask)
+        B, K, L = docs_input.shape
+        # print(B, K, L)
+        squeeze_docs_input = torch.reshape(docs_input, (B * K, L))
+        squeeze_docs_mask = torch.reshape(docs_mask, (B*K, -1))
+        # print(input_docs.shape)
+        d_embs = self.docs_encoder(squeeze_docs_input, squeeze_docs_mask)
         d_embs = torch.reshape(d_embs, (B, K, -1))
-        print(d_embs.shape)
+        # print(d_embs.shape)
 
         d_scores = torch.einsum('bij,bjk->bik', d_embs, torch.unsqueeze(q_emb, -1))
         d_scores = d_scores.squeeze()
 
-        del q_emb
-        del d_embs
+        del questions_input, questions_mask, docs_input, docs_mask, squeeze_docs_input, squeeze_docs_mask, q_emb, d_embs
         torch.cuda.empty_cache()
-        print('d_scores', d_scores.shape, d_scores)
+        # print('d_scores', d_scores.shape, d_scores)
 
         return d_scores
     
@@ -221,59 +232,60 @@ class ReplugTransformer(L.LightningModule):
         return torch.reshape(expanded_data, (batch_size * num_docs, -1)) # BK x S
 
     def new_llm_pass(self, questions, docs, answers):
-        # Again, reshape to put into LLM as B x ? shape
-        questions, questions_mask = questions['input_ids'], torch.logical_not(questions['attention_mask'].to(dtype=torch.bool))
-        docs, docs_mask = docs['input_ids'], torch.logical_not(docs['attention_mask'].to(dtype=torch.bool))
-        print(answers['attention_mask'])
-        print(answers['attention_mask'].to(dtype=torch.bool))
-        print(torch.logical_not(answers['attention_mask'].to(dtype=torch.bool)))
-        answers, answers_mask = answers['input_ids'], answers['attention_mask'].to(dtype=torch.bool) # B x A
-        
-        print(answers_mask)
-        B, K, L = docs.shape
-        docs = torch.reshape(docs, (B*K, L))                   # BK x L
-        docs_mask = torch.reshape(docs_mask, (B*K, L))         # BK x L
-        _, answer_length = answers.shape
-        expanded_questions = self.expand_data(questions, B, K)
-        expanded_questions_mask = self.expand_data(questions_mask, B, K)
-        # print('expanded_questions', expanded_questions.shape, expanded_questions)
-        # TODO: reconsider how the inputs are combined, right now they are just concatenated with the padding... Retokenize?
-        combined_input = torch.cat([docs, expanded_questions], dim=1)      # BK x (S + L)
-        combined_input_mask = torch.cat([docs_mask, expanded_questions_mask], dim=1) # BK x (S + L)
-        # print('combined_input', combined_input.shape)
-        expanded_answers = self.expand_data(answers, B, K)
-        expanded_answers_mask = self.expand_data(answers_mask, B, K)
-        print("expanded_answers_mask", expanded_answers_mask)
-        all_scores = []
-        for i in range(answer_length):
-            expected_tokens = expanded_answers[:, i]             # BK x 1
-            expected_tokens_mask = expanded_answers_mask[:, i]   # BK x 1
-            # print('expected_tokens', expected_tokens.shape, expected_tokens)
-            outputs = self.llm(combined_input, combined_input_mask)                   # BK x (S+L+i) x V
-            # print('outputs[logits]', outputs['logits'].shape)
-            last_outputs = outputs['logits'][:, -1, :]           # BK x V
-            # print('last_outputs', last_outputs.shape, last_outputs)
-            scores = last_outputs[torch.arange(B*K), expected_tokens] # BK x 1
-            # print('scores', scores.shape, scores)
-            # print("expected_tokens_mask", expected_tokens_mask)
-            scores = torch.where(expected_tokens_mask == 1, scores, torch.nan)
-            # print('scores', scores.shape, scores)
-            all_scores.append(scores)
+        with torch.no_grad():
+            # Again, reshape to put into LLM as B x ? shape
+            questions_input, questions_mask = questions['input_ids'], torch.logical_not(questions['attention_mask'].to(dtype=torch.bool))
+            docs_input, docs_mask = docs['input_ids'], torch.logical_not(docs['attention_mask'].to(dtype=torch.bool))
+            # print(answers['attention_mask'])
+            # print(answers['attention_mask'].to(dtype=torch.bool))
+            # print(torch.logical_not(answers['attention_mask'].to(dtype=torch.bool)))
+            answers_input, answers_mask = answers['input_ids'], answers['attention_mask'].to(dtype=torch.bool) # B x A
+            
+            # print(answers_mask)
+            B, K, L = docs_input.shape
+            docs_input = torch.reshape(docs_input, (B*K, L))                   # BK x L
+            docs_mask = torch.reshape(docs_mask, (B*K, L))         # BK x L
+            _, answer_length = answers_input.shape
+            expanded_questions_input = self.expand_data(questions_input, B, K)
+            expanded_questions_mask = self.expand_data(questions_mask, B, K)
+            # print('expanded_questions', expanded_questions.shape, expanded_questions)
+            # TODO: reconsider how the inputs are combined, right now they are just concatenated with the padding... Retokenize?
+            combined_input = torch.cat([docs_input, expanded_questions_input], dim=1)      # BK x (S + L)
+            combined_mask = torch.cat([docs_mask, expanded_questions_mask], dim=1) # BK x (S + L)
+            # print('combined_input', combined_input.shape)
+            expanded_answers_input = self.expand_data(answers_input, B, K)
+            expanded_answers_mask = self.expand_data(answers_mask, B, K)
+            # print("expanded_answers_mask", expanded_answers_mask)
+            all_scores = []
+            for i in range(answer_length):
+                expected_tokens = expanded_answers_input[:, i]             # BK x 1
+                expected_mask = expanded_answers_mask[:, i]   # BK x 1
+                # print('expected_tokens', expected_tokens.shape, expected_tokens)
+                outputs = self.llm(combined_input, combined_mask)                   # BK x (S+L+i) x V
+                # print('outputs[logits]', outputs['logits'].shape)
+                last_outputs = outputs['logits'][:, -1, :]           # BK x V
+                # print('last_outputs', last_outputs.shape, last_outputs)
+                scores = last_outputs[torch.arange(B*K), expected_tokens] # BK x 1
+                # print('scores', scores.shape, scores)
+                # print("expected_tokens_mask", expected_tokens_mask)
+                scores = torch.where(expected_mask == 1, scores, torch.nan)
+                # print('scores', scores.shape, scores)
+                all_scores.append(scores)
 
-            combined_input = torch.cat([combined_input, torch.unsqueeze(expected_tokens, 1)], dim=1) #BK x (S + L + i)
-            combined_input_mask = torch.cat([combined_input_mask, torch.unsqueeze(expected_tokens_mask, 1)], dim=1)
-            del expected_tokens
-            del expected_tokens_mask
-            del outputs
-            del last_outputs
+                combined_input = torch.cat([combined_input, torch.unsqueeze(expected_tokens, 1)], dim=1) #BK x (S + L + i)
+                combined_mask = torch.cat([combined_mask, torch.unsqueeze(expected_mask, 1)], dim=1)
+                del expected_tokens, expected_mask, outputs, last_outputs
+                torch.cuda.empty_cache()
+            all_scores = torch.stack([x for x in all_scores], dim=1)
+            # print('all_scores', all_scores.shape, all_scores)
+            all_scores = all_scores.reshape(B, K, -1)
+            # print('all_scores', all_scores.shape, all_scores)
+            all_scores = torch.nanmean(all_scores, dim=-1)
+            # print('all_scores', all_scores.shape, all_scores)
+            del questions_input, questions_mask, docs_input, docs_mask, answers_input, answers_mask
+            del expanded_questions_input, expanded_questions_mask, expanded_answers_input, expanded_answers_mask, combined_input, combined_mask
             torch.cuda.empty_cache()
-        all_scores = torch.stack([x for x in all_scores], dim=1)
-        print('all_scores', all_scores.shape, all_scores)
-        all_scores = all_scores.reshape(B, K, -1)
-        print('all_scores', all_scores.shape, all_scores)
-        all_scores = torch.nanmean(all_scores, dim=-1)
-        print('all_scores', all_scores.shape, all_scores)
-        return all_scores
+            return all_scores
 
     def training_step(self, batch, batch_idx):
         # TODO: Make this actually work with the dataset constructed above
@@ -283,10 +295,14 @@ class ReplugTransformer(L.LightningModule):
         answers = batch['answers']
         tokenized_questions = tokenizer(questions, padding=True, return_tensors='pt').to(device)
         tokenized_docs = tokenizer([x for retr in docs for x in retr], padding='max_length', truncation=True, max_length=100, return_tensors='pt').to(device)
-        tokenized_docs['input_ids'] = torch.reshape(tokenized_docs['input_ids'], (len(docs[0]), len(docs), -1))
-        tokenized_docs['attention_mask'] = torch.reshape(tokenized_docs['attention_mask'], (len(batch['retrieved'][0]), len(batch['retrieved']), -1))
+        tokenized_docs['input_ids'] = torch.transpose(torch.reshape(tokenized_docs['input_ids'], (len(docs), len(docs[0]), -1)), 0, 1)
+        tokenized_docs['attention_mask'] = torch.transpose(torch.reshape(tokenized_docs['attention_mask'], (len(batch['retrieved']), len(batch['retrieved'][0]), -1)), 0, 1)
         tokenized_answers = tokenizer(answers, padding=True, return_tensors='pt').to(device)
 
+        self.query_encoder = self.query_encoder.to(device)
+        self.docs_encoder = self.docs_encoder.to(device)
+        self.llm = self.llm.to(device)
+        
         # Normalize the retrieval scores from the forward pass
         # TODO: Apply the masks in the scoring process - currently no masks but still converges on single batch
 
@@ -297,25 +313,29 @@ class ReplugTransformer(L.LightningModule):
         llm_output = self.new_llm_pass(tokenized_questions, tokenized_docs, tokenized_answers)
         llm_dist = torch.nn.functional.softmax(llm_output, dim=1)
 
-        print('rerank', rerank_dist.shape, rerank_dist)
+        # print('rerank', rerank_dist.shape, rerank_dist)
         # print(rerank_dist)
-        print('llm', llm_dist.shape, llm_dist)
+        # print('llm', llm_dist.shape, llm_dist)
         # print(llm_dist)
 
         # Compute loss = kldiv(scores, nlls)
         lossfn = torch.nn.KLDivLoss(reduction='batchmean')
         loss = lossfn(rerank_dist, llm_dist) # see docs for notation https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
         print(loss)
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
-        wandb.log({'train_loss': loss})
+        self.log('train_loss', loss.item(), on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
+        wandb.log({'train_loss': loss.item()})
+        del tokenized_questions, tokenized_docs, tokenized_answers, reranker_output, rerank_dist, llm_output, llm_dist, lossfn
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.encoder.parameters(), lr=1e-4)
+        params = list(self.query_encoder.parameters()) + list(self.docs_encoder.parameters())
+        return torch.optim.AdamW(params, lr=1e-4)
     
 model = ReplugTransformer(vocab_size=tokenizer.vocab_size)
+# trainer = L.Trainer(accelerator='gpu', devices=3, max_epochs=1)
 trainer = L.Trainer(max_epochs=1)
-trainer.fit(model, tiny_train_loader, tiny_valid_loader)
+trainer.fit(model, train_loader, valid_loader)
+model.push_to_hub("ndc227/reranker_basic")
 
 #for batch in ds['train']:
 #  batch_scores = net(batch) # Bx1 float
