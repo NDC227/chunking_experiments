@@ -1,3 +1,4 @@
+import numpy as np
 from transformers import AutoTokenizer
 import wandb
 from transformers import AutoModelForCausalLM
@@ -5,6 +6,8 @@ import torch
 import torch.nn as nn
 import lightning as L
 from huggingface_hub import PyTorchModelHubMixin
+import evaluate
+from tqdm import tqdm
 
 device = 'cuda' if torch.cuda.is_available else 'cpu'
 
@@ -36,7 +39,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         self.model_id = llm_model
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
         self.vocab_size = self.tokenizer.vocab_size
-        self.query_encoder = Encoder(self.vocab_size)
+        self.question_encoder = Encoder(self.vocab_size)
         self.docs_encoder = Encoder(self.vocab_size)
         self.llm = AutoModelForCausalLM.from_pretrained(self.model_id)  # LLM to get NLLs for reference distribution in KL div 
         for param in self.llm.parameters():
@@ -50,7 +53,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         # print(len(docs), questions.shape, docs[0].shape)
         # print('docs', docs.shape, docs)
         n_examples = questions_input.shape[0]
-        q_emb = self.query_encoder(questions_input, questions_mask)
+        q_emb = self.question_encoder(questions_input, questions_mask)
         # print('q_emb', q_emb.shape, q_emb)
         # Squeeze and unsqueeze to pass batch of retrievals into encoder at once?
         # Turn B x K x L to (BK) x L
@@ -142,10 +145,10 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         tokenized_questions = self.tokenizer(questions, padding=True, return_tensors='pt').to(device)
         tokenized_docs = self.tokenizer([x for retr in docs for x in retr], padding='max_length', truncation=True, max_length=100, return_tensors='pt').to(device)
         tokenized_docs['input_ids'] = torch.transpose(torch.reshape(tokenized_docs['input_ids'], (len(docs), len(docs[0]), -1)), 0, 1)
-        tokenized_docs['attention_mask'] = torch.transpose(torch.reshape(tokenized_docs['attention_mask'], (len(batch['retrieved']), len(batch['retrieved'][0]), -1)), 0, 1)
+        tokenized_docs['attention_mask'] = torch.transpose(torch.reshape(tokenized_docs['attention_mask'], (len(docs), len(docs[0]), -1)), 0, 1)
         tokenized_answers = self.tokenizer(answers, padding=True, return_tensors='pt').to(device)
 
-        self.query_encoder = self.query_encoder.to(device)
+        self.question_encoder = self.question_encoder.to(device)
         self.docs_encoder = self.docs_encoder.to(device)
         self.llm = self.llm.to(device)
         
@@ -174,5 +177,124 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         return loss
 
     def configure_optimizers(self):
-        params = list(self.query_encoder.parameters()) + list(self.docs_encoder.parameters())
+        params = list(self.question_encoder.parameters()) + list(self.docs_encoder.parameters())
         return torch.optim.AdamW(params, lr=1e-4)
+    
+    def inference(self, questions, docs, top_k):
+        scores = self.forward(questions, docs)
+        order = torch.argsort(scores, descending=True)
+        scores, _ = torch.sort(scores, descending=True)
+        return scores[:,:top_k], order[:,:top_k]
+    
+    def ensemble_predict(self, questions, docs, docs_scores):
+        questions_input, questions_mask = questions['input_ids'], torch.logical_not(questions['attention_mask'].to(dtype=torch.bool))
+        docs_input, docs_mask = docs['input_ids'], torch.logical_not(docs['attention_mask'].to(dtype=torch.bool))
+        B, K, L = docs_input.shape
+        docs_input = torch.reshape(docs_input, (B*K, L))                   # BK x L
+        docs_mask = torch.reshape(docs_mask, (B*K, L))         # BK x L
+        # _, answer_length = answers_input.shape
+        # print('questions_input', questions_input.shape)
+        expanded_questions_input = self.expand_data(questions_input, B, K)
+        expanded_questions_mask = self.expand_data(questions_mask, B, K)
+        # print('expanded_questions', expanded_questions.shape, expanded_questions)
+        # TODO: reconsider how the inputs are combined, right now they are just concatenated with the padding... Retokenize?
+        combined_input = torch.cat([docs_input, expanded_questions_input], dim=1)      # BK x (S + L)
+        combined_mask = torch.cat([docs_mask, expanded_questions_mask], dim=1) # BK x (S + L)
+        # print('combined_input', combined_input.shape)
+        # expanded_answers_input = self.expand_data(answers_input, B, K)
+        # expanded_answers_mask = self.expand_data(answers_mask, B, K)
+        # print("expanded_answers_mask", expanded_answers_mask)
+        docs_scores = torch.unsqueeze(docs_scores, dim=2)
+        all_preds = []
+        for i in range(8):
+            # print('combined_input', combined_input.shape)
+            # expected_tokens = expanded_answers_input[:, i]             # BK x 1
+            # expected_mask = expanded_answers_mask[:, i]   # BK x 1
+            # print('expected_tokens', expected_tokens.shape, expected_tokens)
+            outputs = self.llm(combined_input, combined_mask)                   # BK x (S+L+i) x V
+            # print('outputs[logits]', outputs['logits'].shape)
+            last_outputs = outputs['logits'][:, -1, :]           # BK x V
+            # print('last_outputs', last_outputs.shape)
+            # Aggregate across the documents of each question:
+            last_outputs = torch.reshape(last_outputs, (B, K, -1)) # B x K x V
+            # print("docs_scores", docs_scores.shape, docs_scores)
+            
+            # print("docs_scores", docs_scores.shape, docs_scores)
+            expanded_docs_scores = docs_scores.expand(last_outputs.shape)
+            # print("docs_scores", docs_scores.shape, docs_scores)
+            last_outputs = last_outputs * expanded_docs_scores
+            # print('last_outputs', last_outputs.shape)
+            aggregate_outputs = torch.mean(last_outputs, dim=1)    # B x V
+            # print('aggregate_outputs', aggregate_outputs.shape)
+            # scores = last_outputs[torch.arange(B*K), expected_tokens]
+            pred_tokens = torch.argmax(aggregate_outputs, dim=1)   # B x 1
+            pred_tokens = torch.unsqueeze(pred_tokens, dim=1)
+            # print('pred_tokens', pred_tokens.shape)
+            all_preds.append(pred_tokens)
+
+            expanded_pred_tokens = self.expand_data(pred_tokens, B, K) # BK x 1
+            pred_mask = torch.ones((B * K, 1)).to(device)
+            # print('scores', scores.shape, scores)
+            # print("expected_tokens_mask", expected_tokens_mask)
+            # scores = torch.where(expected_mask == 1, scores, torch.nan)
+            # print('scores', scores.shape, scores)
+            # all_scores.append(scores)
+
+            combined_input = torch.cat([combined_input, expanded_pred_tokens], dim=1) #BK x (S + L + i)
+            combined_mask = torch.cat([combined_mask, pred_mask], dim=1)
+            # del expected_tokens, expected_mask, outputs, last_outputs
+            # torch.cuda.empty_cache()
+        all_preds = torch.stack([x for x in all_preds], dim=1) # B x P
+        all_preds = torch.reshape(all_preds, (B, -1))
+        # print('all_preds', all_preds.shape, all_preds)
+        decoded_preds = self.tokenizer.batch_decode(all_preds)
+        print(decoded_preds)
+        # print('all_scores', all_scores.shape, all_scores)
+        # all_scores = all_scores.reshape(B, K, -1)
+        # print('all_scores', all_scores.shape, all_scores)
+        # all_scores = torch.nanmean(all_scores, dim=-1)
+        return decoded_preds
+
+    def eval(self, valid_loader, top_k, rerank=True):
+        bleu = evaluate.load('bleu')
+        predictions = []
+        references = []
+
+        self.question_encoder.to(device)
+        self.docs_encoder.to(device)
+        self.llm.to(device)
+        self.question_encoder.eval()
+        self.docs_encoder.eval()
+        self.llm.eval()
+        for batch in tqdm(valid_loader):
+            questions = batch['questions']
+            docs = batch['retrieved']
+            
+            tokenized_questions = self.tokenizer(questions, padding=True, return_tensors='pt').to(device)
+            tokenized_docs = self.tokenizer([x for retr in docs for x in retr], padding='max_length', truncation=True, max_length=100, return_tensors='pt').to(device)
+            tokenized_docs['input_ids'] = torch.transpose(torch.reshape(tokenized_docs['input_ids'], (len(docs), len(docs[0]), -1)), 0, 1)
+            tokenized_docs['attention_mask'] = torch.transpose(torch.reshape(tokenized_docs['attention_mask'], (len(docs), len(docs[0]), -1)), 0, 1)
+            # tokenized_answers = self.tokenizer(answers, padding=True, return_tensors='pt').to(device)
+
+            rerank_scores, rerank_order = self.inference(tokenized_questions, tokenized_docs, top_k)
+            rerank_scores = torch.nn.functional.softmax(rerank_scores, dim=1)
+            # print(rerank_scores)
+            # print(rerank_order)
+            new_docs = np.take(docs, rerank_order.cpu())
+            queries = [['Context: ' + d + " Question: " + questions[i] + "? Answer: " for i, d in enumerate(doc)] for doc in new_docs]
+            print(queries)
+            queries = [q for query in queries for q in query]
+            tokenized_new_docs = self.tokenizer([x for retr in new_docs for x in retr], padding='max_length', truncation=True, max_length=100, return_tensors='pt').to(device)
+            tokenized_new_docs['input_ids'] = torch.reshape(tokenized_new_docs['input_ids'], (len(new_docs), len(new_docs[0]), -1))
+            tokenized_new_docs['attention_mask'] = torch.reshape(tokenized_new_docs['attention_mask'], (len(new_docs), len(new_docs[0]), -1))
+            
+            # print("tokenized_new_docs", tokenized_new_docs['input_ids'].shape)
+            preds = self.ensemble_predict(tokenized_questions, tokenized_new_docs, rerank_scores) # B x len(P)
+
+            # results = bleu.compute(predictions=preds, references=[[answer] for answer in answers])
+            # print(results)
+            answers = batch['answers']
+            predictions += preds
+            references += [[answer] for answer in answers]
+        results = bleu.compute(predictions=predictions, references=references)
+        print(results)

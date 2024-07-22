@@ -7,10 +7,12 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 from fast_bm25 import BM25
 
+# Sample use:
+# python create_datasets.py --dir data --output_name chunks_retrieve_100 --retrieve_k 100
 argp = argparse.ArgumentParser()
 argp.add_argument('--dir', default='data')
 argp.add_argument('--output_name', default='chunks')
-argp.add_argument('--retrieve_k', default=10)
+argp.add_argument('--retrieve_k', default=10, type=int)
 args = argp.parse_args()
 
 class DocWrapper(object):

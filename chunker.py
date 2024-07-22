@@ -331,7 +331,9 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         params = list(self.query_encoder.parameters()) + list(self.docs_encoder.parameters())
         return torch.optim.AdamW(params, lr=1e-4)
     
-model = ReplugTransformer(vocab_size=tokenizer.vocab_size)
+# model = ReplugTransformer(vocab_size=tokenizer.vocab_size)
+from replug_transformer import ReplugTransformer
+model = ReplugTransformer(model_id)
 # trainer = L.Trainer(accelerator='gpu', devices=3, max_epochs=1)
 trainer = L.Trainer(max_epochs=1)
 trainer.fit(model, train_loader, valid_loader)

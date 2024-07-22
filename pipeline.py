@@ -3,21 +3,24 @@ from datasets import load_dataset
 import os
 from torch.utils.data import DataLoader
 from datasets import Dataset
-from transformers import AutoTokenizer
 import wandb
 import torch.cuda
 import lightning as L
 
 from replug_transformer import ReplugTransformer
 
+# Sample use
+# python pipeline.py --llm_name facebook/opt-125m --train --batch_size 8 --train_epochs 1 --train_set train_chunks_with_retrieve --valid_set valid_chunks_with_retrieve
+# python pipeline.py --llm_name facebook/opt-125m --eval --batch_size 8 --train_set train_chunks_with_retrieve --valid_set valid_chunks_with_retrieve
+
 argp = argparse.ArgumentParser()
 argp.add_argument('--llm_name', default='facebook/opt-125m')
-argp.add_argument('--train', default=False)
-argp.add_argument('--eval', default=False)
-argp.add_argument('--tiny', default=False)
-argp.add_argument('--batch_size', default=8)
-argp.add_argument('--train_epochs', default=1)
-argp.add_argument('--lr', default=1e-4)
+argp.add_argument('--train', action='store_true')
+argp.add_argument('--eval', action='store_true')
+argp.add_argument('--tiny', action='store_true')
+argp.add_argument('--batch_size', default=8, type=int)
+argp.add_argument('--train_epochs', default=1, type=int)
+argp.add_argument('--lr', default=1e-4, type=float)
 argp.add_argument('--train_set', default='train_chunks_with_retrieve')
 argp.add_argument('--valid_set', default='valid_chunks_with_retrieve')
 args = argp.parse_args()
@@ -34,7 +37,6 @@ if args.tiny:
 
 batch_size = args.batch_size
 model_id = args.llm_name
-tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True)
@@ -62,4 +64,18 @@ if args.train:
     model.push_to_hub('ndc227/reranker_basic')
 
 if args.eval:
-    pass
+    model.eval(valid_loader, top_k=5)
+    # from transformers import AutoTokenizer
+    # tokenizer = AutoTokenizer.from_pretrained(model_id)
+    # model.query_encoder.to(device)
+    # model.docs_encoder.to(device)
+    # for batch in valid_loader:
+    #     questions = batch['questions']
+    #     docs = batch['retrieved']
+    #     tokenized_questions = tokenizer(questions, padding=True, return_tensors='pt').to(device)
+    #     tokenized_docs = tokenizer([x for retr in docs for x in retr], padding='max_length', truncation=True, max_length=100, return_tensors='pt').to(device)
+    #     tokenized_docs['input_ids'] = torch.transpose(torch.reshape(tokenized_docs['input_ids'], (len(docs), len(docs[0]), -1)), 0, 1)
+    #     tokenized_docs['attention_mask'] = torch.transpose(torch.reshape(tokenized_docs['attention_mask'], (len(batch['retrieved']), len(batch['retrieved'][0]), -1)), 0, 1)
+
+    #     rerank_order = model.inference(tokenized_questions, tokenized_docs)
+    #     print(rerank_order)
