@@ -1,4 +1,5 @@
 import argparse
+import os
 from datasets import load_dataset, Dataset
 from langchain_text_splitters import RecursiveCharacterTextSplitter, TokenTextSplitter, CharacterTextSplitter, NLTKTextSplitter,\
                                      SentenceTransformersTokenTextSplitter, SpacyTextSplitter
@@ -14,6 +15,8 @@ argp.add_argument('--dir', default='data')
 argp.add_argument('--output_name', default='chunks')
 argp.add_argument('--retrieve_k', default=10, type=int)
 args = argp.parse_args()
+
+os.environ['HF_TOKEN'] = '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'
 
 class DocWrapper(object):
   def __init__(self, s):
@@ -32,7 +35,6 @@ def retrieve_from_query(query, k):
 # For (fast) BM25
 def add_retrieval_results(ex):
     ex['retrieved'] = retrieve_from_query(ex['questions'][0]['input_text'], k=args.retrieve_k)
-    # one alternative here for speed could be to not use Chroma but some kind of sparse search like Elastic
     return ex
 
 # Data pre-processing (tokenize and de-nesting)
@@ -92,13 +94,18 @@ bm25 = BM25(tokenized_splits)
 
 train_dataset = Dataset.from_dict(ds['train'][:])
 train_dataset = train_dataset.map(add_retrieval_results)
+train_dataset = train_dataset.filter(lambda ex: len(ex['retrieved']) == args.retrieve_k)
 train_dataset = train_dataset.map(preprocess)
 train_dataset = train_dataset.remove_columns(['contexts', 'has_correct_context', 'name', 'id'])
 
 valid_dataset = Dataset.from_dict(ds['validation'][:])
 valid_dataset = valid_dataset.map(add_retrieval_results)
+valid_dataset = valid_dataset.filter(lambda ex: len(ex['retrieved']) == args.retrieve_k)
 valid_dataset = valid_dataset.map(preprocess)
 valid_dataset = valid_dataset.remove_columns(['contexts', 'has_correct_context', 'name', 'id'])
 
-train_dataset.to_json(f'{args.dir}/{args.output_name}_train.json')
-valid_dataset.to_json(f'{args.dir}/{args.output_name}_valid.json')
+# train_dataset.to_json(f'{args.dir}/{args.output_name}_train.json')
+# valid_dataset.to_json(f'{args.dir}/{args.output_name}_valid.json')
+
+train_dataset.push_to_hub(f'ndc227/{args.output_name}_train', private=True)
+valid_dataset.push_to_hub(f'ndc227/{args.output_name}_valid', private=True)

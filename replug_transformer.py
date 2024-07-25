@@ -38,6 +38,8 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         # self.encoder = Transformer(vocab_size=vocab_size)
         self.model_id = llm_model
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        self.tokenizer.padding_side = 'left'
+        # self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.vocab_size = self.tokenizer.vocab_size
         self.question_encoder = Encoder(self.vocab_size)
         self.docs_encoder = Encoder(self.vocab_size)
@@ -80,7 +82,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         expanded_data = expanded_data.expand(-1, num_docs, -1)           # B x K x S
         return torch.reshape(expanded_data, (batch_size * num_docs, -1)) # BK x S
 
-    def new_llm_pass(self, questions, docs, answers):
+    def llm_pass(self, questions, docs, answers):
         with torch.no_grad():
             # Again, reshape to put into LLM as B x ? shape
             questions_input, questions_mask = questions['input_ids'], questions['attention_mask'].to(dtype=torch.bool)
@@ -159,7 +161,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         rerank_dist = torch.nn.functional.log_softmax(reranker_output, dim=1)
         
         # Run an LLM to get the NLLs - NLLs or is it just the logits??
-        llm_output = self.new_llm_pass(tokenized_questions, tokenized_docs, tokenized_answers)
+        llm_output = self.llm_pass(tokenized_questions, tokenized_docs, tokenized_answers)
         llm_dist = torch.nn.functional.softmax(llm_output, dim=1)
 
         # print('rerank', rerank_dist.shape, rerank_dist)
@@ -195,9 +197,9 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         # print('combined_input', combined_input.shape)
         docs_scores = torch.unsqueeze(docs_scores, dim=2)
         all_preds = []
-        for i in range(8):
+        for i in range(16):
             # print('combined_input', combined_input.shape)
-            outputs = self.llm(combined_input, combined_mask)                   # BK x (S+L+i) x V
+            outputs = self.llm(input_ids=combined_input, attention_mask=combined_mask)                   # BK x (S+L+i) x V
             # print('outputs[logits]', outputs['logits'].shape)
             last_outputs = outputs['logits'][:, -1, :]           # BK x V
             # print('last_outputs', last_outputs.shape)
@@ -225,6 +227,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         all_preds = torch.reshape(all_preds, (B, -1))
         # print('all_preds', all_preds.shape, all_preds)
         decoded_preds = self.tokenizer.batch_decode(all_preds)
+        decoded_preds = [pred.split("\n\n")[0] for pred in decoded_preds]
         print(decoded_preds)
         del all_preds, combined_input, combined_mask
         torch.cuda.empty_cache()
@@ -258,14 +261,16 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
             # print(docs)
             new_docs = np.take_along_axis(np.asarray(docs), rerank_order.cpu().numpy(), axis=1)
             # print(new_docs)
-            queries = [['Context: ' + d + " Question: " + questions[i] + "? Answer: " for d in doc] for i, doc in enumerate(new_docs)]
+            queries = [['Please answer the following question concisely and specifically. Context: ' + d + " Question: " + questions[i] + "? Answer:" for d in doc] for i, doc in enumerate(new_docs)]
             # print(np.asarray(queries))
             queries = [q for query in queries for q in query]
             # print(queries)
             # tokenized_queries = self.tokenizer(queries, padding='max_length', truncation=True, max_length=100, return_tensors='pt').to(device)
             tokenized_queries = self.tokenizer(queries, padding=True, return_tensors='pt').to(device)
+            
             # print("tokenized_new_docs", tokenized_new_docs['input_ids'].shape)
             preds = self.ensemble_predict(tokenized_queries, rerank_scores) # B x len(P)
+            
             # results = bleu.compute(predictions=preds, references=[[answer] for answer in answers])
             # print(results)
             answers = batch['answers']
@@ -273,5 +278,17 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
             references += [[answer] for answer in answers]
             del tokenized_questions, tokenized_docs, rerank_scores, rerank_order, tokenized_queries
             torch.cuda.empty_cache()
+
+            # new_queries = ["Please answer the following question concisely and specifically. Question: " + question + "?" for question in questions]
+            # print(new_queries)
+            # new_preds = self.ensemble_predict(tokenized_new_queries, torch.ones((len(questions), 1)).to(device))
+            
+            # tokenized_new_queries = self.tokenizer(new_queries, padding=True, return_tensors='pt').to(device)
+            # tokenized_new_query_inputs, tokenized_new_query_masks = tokenized_new_queries['input_ids'], tokenized_new_queries['attention_mask']
+            # new_preds = self.llm.generate(input_ids=tokenized_new_query_inputs, attention_mask=tokenized_new_query_masks, max_new_tokens=16,
+            #                               tokenizer=self.tokenizer, stop_strings=["\n\n"])
+            # new_preds = self.tokenizer.batch_decode(new_preds)
+            # print(new_preds)
+            # quit(0)
         results = bleu.compute(predictions=predictions, references=references)
         print(results)
