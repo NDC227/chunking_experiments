@@ -152,6 +152,25 @@ Answer: vice president
             queries = [prompt + f'For the final question, answer using the given contexts:\n' + \
                 f'Context:{d}' + \
                 f'\nQuestion:{questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in doc]
+            
+#             queries = [f"""<|system|>
+# You are an assistant who gives short, succinct answers to questions. Please answer in the following format:
+# Question: who was leander paes partner in the mixed doubles at the us open in 2008?
+# Answer: Cara Black
+
+# Question: who takes over after a president is impeached?
+# Answer: vice president
+
+# Question: who plays the dogs voice in downward dog?
+# Answer: Samm Hodges
+
+# Question: when did the name of persia change to iran?
+# Answer: 1935<|end|>
+# <|user|>
+# Context: {d}
+# Question: {questions[i]}?<|end|>
+# <|assistant|>
+# Answer:""" for i, doc in enumerate(docs) for d in doc]
             # queries = [['Please answer the following question using the following context. The answer should not restate the question.\n\nContext: ' + d + '\n\nQuestion: ' + questions[i] + '?\n\nVery short answer:' for d in doc] for i, doc in enumerate(docs)]
             # queries = [q for query in queries for q in query]
             # print(queries[:6])
@@ -300,16 +319,38 @@ Answer: vice president
         torch.cuda.empty_cache()
         return decoded_preds
     
-    def ensemble_predict_2(self, questions, docs):
-        prompt = """Question: who was leander paes partner in the mixed doubles at the us open in 2008?
+    def ensemble_predict_2(self, questions, docs):        
+#         prompt = """Question: who was leander paes partner in the mixed doubles at the us open in 2008?
+# Answer: Cara Black
+
+# Question: who takes over after a president is impeached?
+# Answer: vice president
+# """
+#         query = [prompt + f'For the final question, answer using the given contexts:\n' + \
+#                 '\n'.join(['Context: ' + d for d in doc]) + \
+#                 f'\nQuestion:{questions[i]}?\nAnswer:' for i, doc in enumerate(docs)]
+        
+        query = [f"""<|system|>
+You are an assistant who gives short, succinct answers to questions. Please answer in the following format:
+Question: who was leander paes partner in the mixed doubles at the us open in 2008?
 Answer: Cara Black
 
 Question: who takes over after a president is impeached?
 Answer: vice president
+
+Question: who plays the dogs voice in downward dog?
+Answer: Samm Hodges
+
+Question: when did the name of persia change to iran?
+Answer: 1935<|end|>
+<|user|>
+For this last question, use the following contexts to answer the question.
+""" + \
+'\n'.join(['Context: ' + d for d in doc]) +\
 """
-        query = [prompt + f'For the final question, answer using the given contexts:\n' + \
-                '\n'.join(['Context: ' + d for d in doc]) + \
-                f'\nQuestion:{questions[i]}?\nAnswer:' for i, doc in enumerate(docs)]
+Question: {questions[i]}?<|end|>
+<|assistant|>
+Answer:""" for i, doc in enumerate(docs)]
         # print(query)
         tokenized_query = self.tokenizer(query, padding=True, return_tensors='pt').to(device)
         outputs = self.llm.generate(**tokenized_query, max_new_tokens=16, tokenizer=self.tokenizer, stop_strings=['\n'])
@@ -318,7 +359,7 @@ Answer: vice president
         # print(outputs.shape)
         decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
         decoded_outputs = [output.strip() for output in decoded_outputs]
-        print('decoded_outputs', decoded_outputs)
+        # print('decoded_outputs', decoded_outputs)
         del tokenized_query, outputs
         torch.cuda.empty_cache()
         # quit(0)
@@ -351,32 +392,42 @@ Answer: vice president
             tokenized_docs['input_ids'] = torch.transpose(torch.reshape(tokenized_docs['input_ids'], (len(docs), len(docs[0]), -1)), 0, 1)
             tokenized_docs['attention_mask'] = torch.transpose(torch.reshape(tokenized_docs['attention_mask'], (len(docs), len(docs[0]), -1)), 0, 1)
 
-            rerank_scores, rerank_order = self.inference(tokenized_questions, tokenized_docs, top_k)
-            rerank_scores = torch.nn.functional.softmax(rerank_scores / temp, dim=1)
-            # print('rerank_scores', rerank_scores.shape, rerank_scores)
-            # print(rerank_order)
-            docs = np.asarray(docs).T
-            # print(docs)
-            new_docs = np.take_along_axis(np.asarray(docs), rerank_order.cpu().numpy(), axis=1)
-            # print(np.asarray(new_docs))
-            # queries = [['Please answer the following question using the following context. \n\nContext: ' + d + '\n\nQuestion: ' + questions[i] + '?\n\nVery short answer:' for d in doc] for i, doc in enumerate(new_docs)]
-            # print(np.asarray(queries))
-            # queries = [q for query in queries for q in query]
-            # print(queries)
-            # tokenized_queries = self.tokenizer(queries, padding='max_length', truncation=True, max_length=100, return_tensors='pt').to(device)
-            # tokenized_queries = self.tokenizer(queries, padding=True, return_tensors='pt').to(device)
-            
-            # print('tokenized_new_docs', tokenized_new_docs['input_ids'].shape)
+            if rerank:
+                rerank_scores, rerank_order = self.inference(tokenized_questions, tokenized_docs, top_k)
+                rerank_scores = torch.nn.functional.softmax(rerank_scores / temp, dim=1)
+                # print('rerank_scores', rerank_scores.shape, rerank_scores)
+                # print(rerank_order)
+                docs = np.asarray(docs).T
+                # print(docs)
+                new_docs = np.take_along_axis(np.asarray(docs), rerank_order.cpu().numpy(), axis=1)
+                # print(np.asarray(new_docs))
+                # queries = [['Please answer the following question using the following context. \n\nContext: ' + d + '\n\nQuestion: ' + questions[i] + '?\n\nVery short answer:' for d in doc] for i, doc in enumerate(new_docs)]
+                # print(np.asarray(queries))
+                # queries = [q for query in queries for q in query]
+                # print(queries)
+                # tokenized_queries = self.tokenizer(queries, padding='max_length', truncation=True, max_length=100, return_tensors='pt').to(device)
+                # tokenized_queries = self.tokenizer(queries, padding=True, return_tensors='pt').to(device)
+                
+                # print('tokenized_new_docs', tokenized_new_docs['input_ids'].shape)
+            else:
+                # print(len(docs), len(docs[0]))
+                new_docs = np.asarray(docs)[:top_k, :].T
+                # print(new_docs)
+                # print(len(new_docs), len(new_docs[0]))
             # preds = self.ensemble_predict(tokenized_queries, rerank_scores) # B x len(P)
             preds = self.ensemble_predict_2(questions, new_docs)
 
-            results = bertscore.compute(predictions=preds, references=[[answer] for answer in answers], lang='en')
+            results = bleu.compute(predictions=preds, references=[[answer] for answer in answers])
+            # results = bertscore.compute(predictions=preds, references=[[answer] for answer in answers], lang='en')
             # print(preds, [[answer] for answer in answers])
             # print(results)
             
             predictions += preds
             references += [[answer] for answer in answers]
-            del tokenized_questions, tokenized_docs, rerank_scores, rerank_order#, tokenized_queries
+            if rerank:
+                del tokenized_questions, tokenized_docs, rerank_scores, rerank_order#, tokenized_queries
+            else:
+                del tokenized_questions, tokenized_docs
             torch.cuda.empty_cache()
 
             # new_queries = ['Please answer the following question using as few words as possible.\n\nQuestion: ' + question + '?\n\nVery short answer: ' for question in questions]

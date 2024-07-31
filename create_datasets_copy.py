@@ -77,18 +77,18 @@ if OPTION == 1:
     # print(docs[:10])
     bm25 = BM25(tokenized_splits)
 
-    train_questions = load_dataset('ContextualAI/nq', split='train')
-    train_dataset = train_questions.map(add_retrieval_results, num_proc=num_proc)
+    train_dataset = load_dataset('ContextualAI/nq', split='train')
+    train_dataset = train_dataset.map(add_retrieval_results, num_proc=num_proc)
     train_dataset = train_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
     train_dataset = train_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
 
-    dev_questions = load_dataset('ContextualAI/nq', split='dev')
-    dev_dataset = dev_questions.map(add_retrieval_results, num_proc=num_proc)
+    dev_dataset = load_dataset('ContextualAI/nq', split='dev')
+    dev_dataset = dev_dataset.map(add_retrieval_results, num_proc=num_proc)
     dev_dataset = dev_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
     dev_dataset = dev_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
 
-    test_questions = load_dataset('ContextualAI/nq', split='test')
-    test_dataset = test_questions.map(add_retrieval_results, num_proc=num_proc)
+    test_dataset = load_dataset('ContextualAI/nq', split='test')
+    test_dataset = test_dataset.map(add_retrieval_results, num_proc=num_proc)
     test_dataset = test_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
     test_dataset = test_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
 
@@ -145,18 +145,18 @@ elif OPTION == 2:
     tokenized_splits = [x.split() for x in all_splits]
     bm25 = BM25(tokenized_splits)
 
-    train_questions = load_dataset('ContextualAI/nq', split='train')
-    train_dataset = train_questions.map(add_retrieval_results, num_proc=num_proc)
+    train_dataset = load_dataset('ContextualAI/nq', split='train')
+    train_dataset = train_dataset.map(add_retrieval_results, num_proc=num_proc)
     train_dataset = train_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
     train_dataset = train_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
 
-    dev_questions = load_dataset('ContextualAI/nq', split='dev')
-    dev_dataset = dev_questions.map(add_retrieval_results, num_proc=num_proc)
+    dev_dataset = load_dataset('ContextualAI/nq', split='dev')
+    dev_dataset = dev_dataset.map(add_retrieval_results, num_proc=num_proc)
     dev_dataset = dev_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
     dev_dataset = dev_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
 
-    test_questions = load_dataset('ContextualAI/nq', split='test')
-    test_dataset = test_questions.map(add_retrieval_results, num_proc=num_proc)
+    test_dataset = load_dataset('ContextualAI/nq', split='test')
+    test_dataset = test_dataset.map(add_retrieval_results, num_proc=num_proc)
     test_dataset = test_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
     test_dataset = test_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
 

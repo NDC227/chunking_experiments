@@ -23,6 +23,7 @@ argp.add_argument('--train', action='store_true')
 argp.add_argument('--eval', action='store_true')
 argp.add_argument('--tiny', action='store_true')
 argp.add_argument('--save', action='store_true')
+argp.add_argument('--baseline', action='store_true')
 argp.add_argument('--batch_size', default=8, type=int)
 argp.add_argument('--train_epochs', default=1, type=int)
 argp.add_argument('--lr', default=1e-4, type=float)
@@ -30,6 +31,7 @@ argp.add_argument('--eval_k', default=10, type=int)
 argp.add_argument('--train_set', default='train_chunks_with_retrieve')
 argp.add_argument('--valid_set', default='valid_chunks_with_retrieve')
 argp.add_argument('--dataset', default='new_chunks_with_retrieve')
+argp.add_argument('--num_proc', default=1, type=int)
 args = argp.parse_args()
 
 os.environ['HF_TOKEN'] = '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'
@@ -40,6 +42,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 batch_size = args.batch_size
 model_id = args.llm_name
+num_proc = args.num_proc
 
 model = ReplugTransformer(model_id)
 
@@ -47,8 +50,8 @@ if args.train:
     # train_dataset = load_dataset(f'ndc227/{args.train_set}', streaming=True)['train']
     # valid_dataset = load_dataset(f'ndc227/{args.valid_set}', streaming=True)['train']
 
-    train_dataset = load_dataset(f'ndc227/{args.dataset}', streaming=True)['train']
-    valid_dataset = load_dataset(f'ndc227/{args.dataset}', streaming=True)['dev']
+    train_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc)['train']
+    valid_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc)['dev']
 
     # train_dataset = train_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
 
@@ -83,9 +86,10 @@ if args.train:
         model.push_to_hub('ndc227/reranker_basic3', private=True)
 
 if args.eval:
-    model = ReplugTransformer.from_pretrained("ndc227/reranker_basic2")
+    if not args.baseline:
+        model = ReplugTransformer.from_pretrained("ndc227/reranker_basic2")
     # valid_dataset = load_dataset(f'ndc227/{args.valid_set}', streaming=True)['train']
-    valid_dataset = load_dataset(f'ndc227/{args.dataset}', streaming=True)['test']
+    valid_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc)['test']
     valid_dataset = valid_dataset.shuffle()
 
     if args.tiny:
@@ -93,4 +97,7 @@ if args.eval:
         
     valid_loader = DataLoader(valid_dataset, batch_size=batch_size)
 
-    model.eval(valid_loader, top_k=args.eval_k)
+    if args.baseline:
+        model.eval(valid_loader, top_k=args.eval_k, rerank=False)
+    else:
+        model.eval(valid_loader, top_k=args.eval_k)
