@@ -24,7 +24,7 @@ class DocWrapper(object):
     self.metadata = {}
 
 def get_splits(splitter, data):
-    return [split.page_content for split in splitter.split_documents(docs)]
+    return [split.page_content for split in splitter.split_documents(data)]
 
 def retrieve_from_query(query, k):
     tokenized_query = query.split()
@@ -43,8 +43,8 @@ def preprocess(ex):
     ex['answers'] = ex['answers'][0]['span_text']
     return ex
 
-ds = load_dataset('cjlovering/natural-questions-short')
-docs = [DocWrapper(ex) for ex in ds['train']]
+ds = load_dataset('cjlovering/natural-questions-short', streaming=True)
+docs = [DocWrapper(ex) for ex in ds['train']] + [DocWrapper(ex) for ex in ds['valid']]
 
 rec_char_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000, chunk_overlap=200, add_start_index=True
