@@ -14,8 +14,9 @@ from replug_transformer import ReplugTransformer
 # python pipeline.py --llm_name facebook/opt-125m --train --batch_size 2 --train_epochs 1 --train_set chunks_retrieve_100_train --valid_set chunks_retrieve_100_valid
 # python pipeline.py --llm_name facebook/opt-125m --train --batch_size 2 --train_epochs 1 --dataset new_chunks_with_retrieve
 # python pipeline.py --llm_name microsoft/Phi-3-mini-4k-instruct --train --batch_size 2 --train_epochs 1 --dataset toy_chunks_with_retrieve
+# python pipeline.py --llm_name microsoft/Phi-3-mini-4k-instruct --train --batch_size 2 --train_epochs 1 --dataset toy_chunks_with_retrieve --tiny  
 # python pipeline.py --llm_name facebook/opt-125m --eval --batch_size 8 --valid_set chunks_retrieve_100_valid --eval_k 10
-# python pipeline.py --llm_name facebook/opt-125m --eval --batch_size 8 --dataset new_chunks_with_retrieve --eval_k 10
+# python pipeline.py --llm_name facebook/opt-125m --eval --batch_size 2 --dataset new_chunks_with_retrieve --eval_k 10
 
 argp = argparse.ArgumentParser()
 argp.add_argument('--llm_name', default='facebook/opt-125m')
@@ -32,6 +33,7 @@ argp.add_argument('--train_set', default='train_chunks_with_retrieve')
 argp.add_argument('--valid_set', default='valid_chunks_with_retrieve')
 argp.add_argument('--dataset', default='new_chunks_with_retrieve')
 argp.add_argument('--num_proc', default=1, type=int)
+argp.add_argument('--num_gpus', default=0, type=int)
 args = argp.parse_args()
 
 os.environ['HF_TOKEN'] = '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'
@@ -50,8 +52,8 @@ if args.train:
     # train_dataset = load_dataset(f'ndc227/{args.train_set}', streaming=True)['train']
     # valid_dataset = load_dataset(f'ndc227/{args.valid_set}', streaming=True)['train']
 
-    train_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc)['train']
-    valid_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc)['dev']
+    train_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')['train']
+    valid_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')['dev']
 
     # train_dataset = train_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
 
@@ -59,10 +61,10 @@ if args.train:
         train_dataset = Dataset.from_dict(train_dataset[:20])
         valid_dataset = Dataset.from_dict(valid_dataset[:20])
         
-    # train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    # valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size)
-    valid_loader = DataLoader(valid_dataset, batch_size=batch_size)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True)
+    # train_loader = DataLoader(train_dataset, batch_size=batch_size)
+    # valid_loader = DataLoader(valid_dataset, batch_size=batch_size)
 
     wandb.login(key='fc6c9280f011612e6aeb6c45fd6f79f7d08c56dc')
     wandb.init(
@@ -79,8 +81,10 @@ if args.train:
         }
     )
 
-    # trainer = L.Trainer(max_epochs=args.train_epochs, accelerator='gpu', devices=4)
-    trainer = L.Trainer(max_epochs=args.train_epochs)
+    if args.num_gpus > 1:
+        trainer = L.Trainer(max_epochs=args.train_epochs, accelerator='gpu', devices=args.num_gpus)
+    else:
+        trainer = L.Trainer(max_epochs=args.train_epochs)
     trainer.fit(model, train_loader, valid_loader)
     if args.save:
         model.push_to_hub('ndc227/reranker_basic3', private=True)
@@ -89,13 +93,13 @@ if args.eval:
     if not args.baseline:
         model = ReplugTransformer.from_pretrained("ndc227/reranker_basic2")
     # valid_dataset = load_dataset(f'ndc227/{args.valid_set}', streaming=True)['train']
-    valid_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc)['test']
-    valid_dataset = valid_dataset.shuffle()
+    valid_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')['test']
+    # valid_dataset = valid_dataset.shuffle()
 
     if args.tiny:
         valid_dataset = Dataset.from_dict(valid_dataset[:20])
         
-    valid_loader = DataLoader(valid_dataset, batch_size=batch_size)
+    valid_loader = DataLoader(valid_dataset, shuffle=True, batch_size=batch_size)
 
     if args.baseline:
         model.eval(valid_loader, top_k=args.eval_k, rerank=False)

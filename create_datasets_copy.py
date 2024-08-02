@@ -6,17 +6,19 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter, TokenTextSp
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_huggingface import HuggingFaceEmbeddings
 from tqdm import tqdm
+from time import process_time
 
 from fast_bm25 import BM25
 
 # Sample use:
 # python create_datasets_copy.py --dir data --output_name chunks_retrieve_100 --retrieve_k 100
-# python create_datasets_copy.py --dir data --output_name new_chunks_with_retrieve --retrieve_k 100
+# python create_datasets_copy.py --dir data --output_name new_chunks_with_retrieve --retrieve_k 100 --num_proc 8
 argp = argparse.ArgumentParser()
 argp.add_argument('--dir', default='data')
 argp.add_argument('--output_name', default='chunks')
 argp.add_argument('--retrieve_k', default=10, type=int)
 argp.add_argument('--num_proc', default=1, type=int)
+argp.add_argument('--chroma', action='store_true')
 args = argp.parse_args()
 
 os.environ['HF_TOKEN'] = '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'
@@ -41,10 +43,11 @@ def add_retrieval_results(ex):
     ex['gold_generation'] = ex['gold_generation'][0]
     return ex
 
-# def add_retrieval_results_2(ex):
-#     ex['retrieved'] = retrieve_from_query(ex['query'], k=args.retrieve_k)
-#     ex['gold_generation'] = ex['gold_generation'][0]
-#     return ex
+# For Chroma
+def add_retrieval_results_chroma(ex):
+    ex['retrieved'] = collection.query(query_texts=[ex['query']], n_results=args.retrieve_k)
+    ex['gold_generation'] = ex['gold_generation'][0]
+    return ex
 
 # Data pre-processing (tokenize and de-nesting)
 def preprocess(ex):
@@ -52,45 +55,68 @@ def preprocess(ex):
     ex['answers'] = ex['answers'][0]['span_text']
     return ex
 
+
+iterable_ds = load_dataset('ContextualAI/wiki_dpr_mapped_nq_field', split='train', streaming=True).take(10000)
+wiki = Dataset.from_generator(lambda: (yield from iterable_ds), features=iterable_ds.features)
 num_proc = args.num_proc
-retrieve_k = args.retrieve_k
-# iterable_ds = load_dataset('ContextualAI/wiki_dpr_mapped_nq_field', split='train', streaming=True).take(10000)
-# wiki = Dataset.from_generator(lambda: (yield from iterable_ds), features=iterable_ds.features)
-wiki = load_dataset('ContextualAI/wiki_dpr_mapped_nq_field', split='train', num_proc=num_proc).take(1000)
+# wiki = load_dataset('ContextualAI/wiki_dpr_mapped_nq_field', split='train', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
 print('loaded wikipedia')
 
 OPTION = 1
 if OPTION == 1:
     # tokenized_splits = [doc.split() for ex in tqdm(wiki) for doc in ex['passages']]
-    tokenized_splits = wiki.map(lambda ex: {'passages':[doc.split() for doc in ex['passages']]}, num_proc=num_proc)['passages']
-    # print(len(tokenized_splits))
-    # print(len(tokenized_splits[0]))
-    # print(len(tokenized_splits[0][0]))
-    # print(tokenized_splits[:10])
-    tokenized_splits = [chunk for article in tokenized_splits for chunk in article]
-    # print(len(tokenized_splits))
-    # print(len(tokenized_splits[0]))
-    # print(tokenized_splits[:10])
+    if not args.chroma:
+        tokenized_splits = wiki.map(lambda ex: {'passages':[doc.split() for doc in ex['passages']]}, num_proc=num_proc)['passages']
+        tokenized_splits = [chunk for article in tokenized_splits for chunk in article]
+    else:
+        tokenized_splits = [chunk for article in wiki['passages'] for chunk in article]
+    all_ids = [str(i) for i in range(len(tokenized_splits))]
     del wiki
     # quit(0)
+    # print(tokenized_splits[:10])
+    print("chunks loaded")
 
     # print(docs[:10])
-    bm25 = BM25(tokenized_splits)
+    start = process_time()
+    if args.chroma:
+        import chromadb
+        chroma_client = chromadb.Client()
+        collection = chroma_client.get_or_create_collection(name='wiki_chunks')
+        print('collection made')
+        # print(tokenized_splits[:2])
+        # print(all_ids[:2])
+        collection.upsert(
+            ids=all_ids,
+            documents=tokenized_splits
+        )
+        print('chroma loaded')
+    else:
+        bm25 = BM25(tokenized_splits)
+        print('bm25 loaded')
+    stop = process_time()
+    print("time elapsed:", stop - start)
 
-    train_dataset = load_dataset('ContextualAI/nq', split='train')
-    train_dataset = train_dataset.map(add_retrieval_results, num_proc=num_proc)
+    train_dataset = load_dataset('ContextualAI/nq', split='train', cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets', num_proc=num_proc)
+    print('train dataset loaded')
+    if args.chroma:
+        train_dataset = train_dataset.map(add_retrieval_results_chroma, num_proc=num_proc)
+    else:
+        train_dataset = train_dataset.map(add_retrieval_results, num_proc=num_proc)
     train_dataset = train_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
-    train_dataset = train_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
+    train_dataset = train_dataset.filter(lambda ex: len(ex['retrieved']) == args.retrieve_k, num_proc=num_proc)
+    print('train dataset processed')
+    # quit(0)
 
-    dev_dataset = load_dataset('ContextualAI/nq', split='dev')
+    dev_dataset = load_dataset('ContextualAI/nq', split='dev', cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets', num_proc=num_proc)
     dev_dataset = dev_dataset.map(add_retrieval_results, num_proc=num_proc)
     dev_dataset = dev_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
-    dev_dataset = dev_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
+    dev_dataset = dev_dataset.filter(lambda ex: len(ex['retrieved']) == args.retrieve_k, num_proc=num_proc)
 
-    test_dataset = load_dataset('ContextualAI/nq', split='test')
+    test_dataset = load_dataset('ContextualAI/nq', split='test', cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets', num_proc=num_proc)
     test_dataset = test_dataset.map(add_retrieval_results, num_proc=num_proc)
     test_dataset = test_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
-    test_dataset = test_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
+    test_dataset = test_dataset.filter(lambda ex: len(ex['retrieved']) == args.retrieve_k, num_proc=num_proc)
+    print('all datasets processed')
 
     combined_dataset = DatasetDict({'train':train_dataset, 'dev':dev_dataset, 'test':test_dataset})
     combined_dataset.push_to_hub(f'ndc227/{args.output_name}', private=True)
@@ -143,22 +169,26 @@ elif OPTION == 2:
     # df.to_json('data/chunks.json')
 
     tokenized_splits = [x.split() for x in all_splits]
+    print('data tokenized')
     bm25 = BM25(tokenized_splits)
+    print('bm25 loaded')
 
-    train_dataset = load_dataset('ContextualAI/nq', split='train')
+    train_dataset = load_dataset('ContextualAI/nq', split='train', cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets', num_proc=num_proc)
     train_dataset = train_dataset.map(add_retrieval_results, num_proc=num_proc)
     train_dataset = train_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
-    train_dataset = train_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
+    train_dataset = train_dataset.filter(lambda ex: len(ex['retrieved']) == args.retrieve_k, num_proc=num_proc)
+    print('train dataset processed')
 
-    dev_dataset = load_dataset('ContextualAI/nq', split='dev')
+    dev_dataset = load_dataset('ContextualAI/nq', split='dev', cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets', num_proc=num_proc)
     dev_dataset = dev_dataset.map(add_retrieval_results, num_proc=num_proc)
     dev_dataset = dev_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
-    dev_dataset = dev_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
+    dev_dataset = dev_dataset.filter(lambda ex: len(ex['retrieved']) == args.retrieve_k, num_proc=num_proc)
 
-    test_dataset = load_dataset('ContextualAI/nq', split='test')
+    test_dataset = load_dataset('ContextualAI/nq', split='test', cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets', num_proc=num_proc)
     test_dataset = test_dataset.map(add_retrieval_results, num_proc=num_proc)
     test_dataset = test_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
-    test_dataset = test_dataset.filter(lambda ex: len(ex['retrieved']) == retrieve_k)
+    test_dataset = test_dataset.filter(lambda ex: len(ex['retrieved']) == args.retrieve_k, num_proc=num_proc)
+    print('all datasets processed')
 
     combined_dataset = DatasetDict({'train':train_dataset, 'dev':dev_dataset, 'test':test_dataset})
     combined_dataset.push_to_hub(f'ndc227/{args.output_name}', private=True)

@@ -40,7 +40,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
         self.tokenizer.padding_side = 'left'
         # self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        self.vocab_size = self.tokenizer.vocab_size
+        self.vocab_size = len(self.tokenizer)
         self.question_encoder = Encoder(self.vocab_size)
         self.docs_encoder = Encoder(self.vocab_size)
         self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')  # LLM to get NLLs for reference distribution in KL div 
@@ -48,8 +48,8 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
             param.requires_grad = False
     
     def forward(self, questions, docs):
-        questions_input, questions_mask = questions['input_ids'], torch.logical_not(questions['attention_mask'].to(dtype=torch.bool))
-        docs_input, docs_mask = docs['input_ids'], torch.logical_not(docs['attention_mask'].to(dtype=torch.bool))
+        questions_input, questions_mask = questions['input_ids'], questions['attention_mask'].to(dtype=torch.bool)
+        docs_input, docs_mask = docs['input_ids'], docs['attention_mask'].to(dtype=torch.bool)
         # Encode questions and documents
         # print('questions', questions)
         # print(len(docs), questions.shape, docs[0].shape)
@@ -143,34 +143,80 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
             docs = np.asarray(docs).T
             B, K = len(docs), len(docs[0])
             # print(B, K)
-            prompt = """Question: who was leander paes partner in the mixed doubles at the us open in 2008?
+            if self.model_id.startswith('meta-llama'):
+                queries = [f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are an assistant who gives short, succinct answers to questions. Please answer according to the following examples:<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+Question: who was leander paes partner in the mixed doubles at the us open in 2008?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: Cara Black<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+Question: who takes over after a president is impeached?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: vice president<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+Question: who plays the dogs voice in downward dog?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: Samm Hodges<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+Question: when did the name of persia change to iran?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: 1935<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+For the final question, use the following context to answer the question.
+Context: {d}
+Question: {questions[i]}?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer:""" for i, doc in enumerate(docs) for d in doc]
+                
+            elif self.model_id.startswith('microsoft'):
+                queries = [f"""<|system|>
+You are an assistant who gives short, succinct answers to questions. Please answer according to the following examples:<|end|>
+<|user|>
+Question: who was leander paes partner in the mixed doubles at the us open in 2008?<|end|>
+<|assistant|>
+Answer: Cara Black<|end|>
+<|user|>
+Question: who takes over after a president is impeached?<|end|>
+<|assistant|>
+Answer: vice president<|end|>
+<|user|>
+Question: who plays the dogs voice in downward dog?<|end|>
+<|assistant|>
+Answer: Samm Hodges<|end|>
+<|user|>
+Question: when did the name of persia change to iran?<|end|>
+<|assistant|>
+Answer: 1935<|end|>
+<|user|>
+For the final question, use the following context to answer the question.
+Context: {d}
+Question: {questions[i]}?<|end|>
+<|assistant|>
+Answer:""" for i, doc in enumerate(docs) for d in doc]
+                
+            else:
+                queries = ["""Question: who was leander paes partner in the mixed doubles at the us open in 2008?
 Answer: Cara Black
 
 Question: who takes over after a president is impeached?
 Answer: vice president
-"""
-            queries = [prompt + f'For the final question, answer using the given contexts:\n' + \
-                f'Context:{d}' + \
-                f'\nQuestion:{questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in doc]
+                           
+Question: who plays the dogs voice in downward dog?
+Answer: Samm Hodges
+                           
+Question: when did the name of persia change to iran?
+Answer: 1935
+""" + \
+f'For the final question, answer using the given context:\n' + \
+f'Context: {d}' + \
+f'\nQuestion: {questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in doc]
             
-#             queries = [f"""<|system|>
-# You are an assistant who gives short, succinct answers to questions. Please answer in the following format:
-# Question: who was leander paes partner in the mixed doubles at the us open in 2008?
-# Answer: Cara Black
-
-# Question: who takes over after a president is impeached?
-# Answer: vice president
-
-# Question: who plays the dogs voice in downward dog?
-# Answer: Samm Hodges
-
-# Question: when did the name of persia change to iran?
-# Answer: 1935<|end|>
-# <|user|>
-# Context: {d}
-# Question: {questions[i]}?<|end|>
-# <|assistant|>
-# Answer:""" for i, doc in enumerate(docs) for d in doc]
             # queries = [['Please answer the following question using the following context. The answer should not restate the question.\n\nContext: ' + d + '\n\nQuestion: ' + questions[i] + '?\n\nVery short answer:' for d in doc] for i, doc in enumerate(docs)]
             # queries = [q for query in queries for q in query]
             # print(queries[:6])
@@ -319,18 +365,42 @@ Answer: vice president
         torch.cuda.empty_cache()
         return decoded_preds
     
-    def ensemble_predict_2(self, questions, docs):        
-#         prompt = """Question: who was leander paes partner in the mixed doubles at the us open in 2008?
-# Answer: Cara Black
+    def ensemble_predict_2(self, questions, docs):
+        if self.model_id.startswith('meta-llama'):
+            query = [f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are an assistant who gives short, succinct answers to questions. Please answer according to the following examples:<|eot_id|>
 
-# Question: who takes over after a president is impeached?
-# Answer: vice president
-# """
-#         query = [prompt + f'For the final question, answer using the given contexts:\n' + \
-#                 '\n'.join(['Context: ' + d for d in doc]) + \
-#                 f'\nQuestion:{questions[i]}?\nAnswer:' for i, doc in enumerate(docs)]
-        
-        query = [f"""<|system|>
+<|start_header_id|>user<|end_header_id|>
+Question: who was leander paes partner in the mixed doubles at the us open in 2008?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: Cara Black<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+Question: who takes over after a president is impeached?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: vice president<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+Question: who plays the dogs voice in downward dog?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: Samm Hodges<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+Question: when did the name of persia change to iran?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: 1935<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+For this last question, use the following contexts to answer the question.
+""" + \
+'\n'.join(['Context: ' + d for d in doc]) +\
+f"""
+Question: {questions[i]}?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer:""" for i, doc in enumerate(docs)]
+            
+        elif self.model_id.startswith('microsoft'):
+            query = [f"""<|system|>
 You are an assistant who gives short, succinct answers to questions. Please answer in the following format:
 Question: who was leander paes partner in the mixed doubles at the us open in 2008?
 Answer: Cara Black
@@ -347,10 +417,26 @@ Answer: 1935<|end|>
 For this last question, use the following contexts to answer the question.
 """ + \
 '\n'.join(['Context: ' + d for d in doc]) +\
-"""
+f"""
 Question: {questions[i]}?<|end|>
 <|assistant|>
 Answer:""" for i, doc in enumerate(docs)]
+        else:
+            query = ["""Question: who was leander paes partner in the mixed doubles at the us open in 2008?
+Answer: Cara Black
+
+Question: who takes over after a president is impeached?
+Answer: vice president
+
+Question: who plays the dogs voice in downward dog?
+Answer: Samm Hodges
+
+Question: when did the name of persia change to iran?
+Answer: 1935
+""" + \
+f'For the final question, answer using the given contexts:\n' + \
+'\n'.join(['Context: ' + d for d in doc]) + \
+f'\nQuestion:{questions[i]}?\nAnswer:' for i, doc in enumerate(docs)]
         # print(query)
         tokenized_query = self.tokenizer(query, padding=True, return_tensors='pt').to(device)
         outputs = self.llm.generate(**tokenized_query, max_new_tokens=16, tokenizer=self.tokenizer, stop_strings=['\n'])
@@ -369,6 +455,7 @@ Answer:""" for i, doc in enumerate(docs)]
         temp = 1
         bleu = evaluate.load('bleu')
         bertscore = evaluate.load('bertscore')
+        chrf = evaluate.load('chrf')
         predictions = []
         references = []
 
@@ -417,7 +504,7 @@ Answer:""" for i, doc in enumerate(docs)]
             # preds = self.ensemble_predict(tokenized_queries, rerank_scores) # B x len(P)
             preds = self.ensemble_predict_2(questions, new_docs)
 
-            results = bleu.compute(predictions=preds, references=[[answer] for answer in answers])
+            # results = bleu.compute(predictions=preds, references=[[answer] for answer in answers])
             # results = bertscore.compute(predictions=preds, references=[[answer] for answer in answers], lang='en')
             # print(preds, [[answer] for answer in answers])
             # print(results)
@@ -441,8 +528,12 @@ Answer:""" for i, doc in enumerate(docs)]
             # new_preds = self.tokenizer.batch_decode(new_preds)
             # print('new_preds', new_preds)
 
-            # print(predictions, references)
+            print(preds, answers)
             # print(bleu.compute(predictions=predictions, references=references))
             # quit(0)
-        results = bleu.compute(predictions=predictions, references=references)
-        print(results)
+        bleu_results = bleu.compute(predictions=predictions, references=references)
+        bertscore_results = bertscore.compute(predictions=predictions, references=references, lang='en')
+        chrf_results = chrf.compute(predictions=predictions, references=references, word_order=1)
+        print(bleu_results)
+        print(bertscore_results)
+        print(chrf_results)
