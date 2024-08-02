@@ -36,6 +36,7 @@ argp.add_argument('--num_proc', default=1, type=int)
 argp.add_argument('--num_gpus', default=0, type=int)
 args = argp.parse_args()
 
+os.environ["WANDB_INIT_TIMEOUT"] = "300"
 os.environ['HF_TOKEN'] = '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'
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -54,8 +55,6 @@ if args.train:
 
     train_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')['train']
     valid_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')['dev']
-
-    # train_dataset = train_dataset.rename_columns({'query':'questions', 'gold_generation':'answers'})
 
     if args.tiny:
         train_dataset = Dataset.from_dict(train_dataset[:20])

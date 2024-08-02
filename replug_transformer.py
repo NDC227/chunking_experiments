@@ -39,11 +39,12 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         self.model_id = llm_model
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
         self.tokenizer.padding_side = 'left'
-        # self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.vocab_size = len(self.tokenizer)
         self.question_encoder = Encoder(self.vocab_size)
         self.docs_encoder = Encoder(self.vocab_size)
         self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')  # LLM to get NLLs for reference distribution in KL div 
+        self.llm.resize_token_embeddings(self.vocab_size)
         for param in self.llm.parameters():
             param.requires_grad = False
     
