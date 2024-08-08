@@ -9,6 +9,8 @@ from huggingface_hub import PyTorchModelHubMixin
 import evaluate
 from tqdm import tqdm
 
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 device = 'cuda' if torch.cuda.is_available else 'cpu'
 
 class Encoder(nn.Module):
@@ -49,32 +51,39 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
             param.requires_grad = False
     
     def forward(self, questions, docs):
-        questions_input, questions_mask = questions['input_ids'], questions['attention_mask'].to(dtype=torch.bool)
-        docs_input, docs_mask = docs['input_ids'], docs['attention_mask'].to(dtype=torch.bool)
+        print(1.2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+        questions_input, questions_mask = questions['input_ids'], torch.logical_not(questions['attention_mask'].to(dtype=torch.bool))
+        docs_input, docs_mask = docs['input_ids'], torch.logical_not(docs['attention_mask'].to(dtype=torch.bool))
         # Encode questions and documents
         # print('questions', questions)
         # print(len(docs), questions.shape, docs[0].shape)
-        # print('docs', docs.shape, docs)
+        # print('docs', docs_input.shape, docs_input)
         n_examples = questions_input.shape[0]
         q_emb = self.question_encoder(questions_input, questions_mask)
+        print(1.3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(),  torch.cuda.memory_allocated())
         # print('q_emb', q_emb.shape, q_emb)
         # Squeeze and unsqueeze to pass batch of retrievals into encoder at once?
         # Turn B x K x L to (BK) x L
         B, K, L = docs_input.shape
         # print(B, K, L)
-        squeeze_docs_input = torch.reshape(docs_input, (B * K, L))
-        squeeze_docs_mask = torch.reshape(docs_mask, (B*K, -1))
-        # print(input_docs.shape)
+        squeeze_docs_input = torch.reshape(docs_input, (B * K, -1))
+        squeeze_docs_mask = torch.reshape(docs_mask, (B * K, -1))
+        print('1.3.0', torch.cuda.mem_get_info(), torch.cuda.memory_reserved(),  torch.cuda.memory_allocated())
+        # print(squeeze_docs_input.shape)
         d_embs = self.docs_encoder(squeeze_docs_input, squeeze_docs_mask)
         d_embs = torch.reshape(d_embs, (B, K, -1))
+        print('1.3.1 docs_encoder input size:', squeeze_docs_input.element_size()*squeeze_docs_input.nelement())
         # print(d_embs.shape)
+        print(1.4, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(),  torch.cuda.memory_allocated())
 
         d_scores = torch.einsum('bij,bjk->bik', d_embs, torch.unsqueeze(q_emb, -1))
         d_scores = d_scores.squeeze()
+        print(1.5, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(),  torch.cuda.memory_allocated())
 
         del questions_input, questions_mask, docs_input, docs_mask, squeeze_docs_input, squeeze_docs_mask, q_emb, d_embs
         torch.cuda.empty_cache()
         # print('d_scores', d_scores.shape, d_scores)
+        print(1.6, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(),  torch.cuda.memory_allocated())
 
         return d_scores
     
@@ -225,6 +234,7 @@ f'\nQuestion: {questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in d
             tokenized_queries = self.tokenizer(queries, padding=True, return_tensors='pt').to(device)
             answers_input, answers_mask = answers['input_ids'], answers['attention_mask'].to(dtype=torch.bool) # B x A
             # print('answers_input', answers_input.shape, answers_input)
+            print(3.1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
             _, answer_length = answers_input.shape
             combined_input = tokenized_queries['input_ids']      # BK x (S + L)
@@ -235,15 +245,39 @@ f'\nQuestion: {questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in d
             # print('expanded_answers_mask', expanded_answers_mask)
             all_scores = []
             for i in range(answer_length):
+                print(3.2, torch.cuda.mem_get_info(), i, torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
                 # print('combined_input', combined_input.shape)
                 expected_tokens = expanded_answers_input[:, i]             # BK x 1
                 expected_mask = expanded_answers_mask[:, i]   # BK x 1
                 # print('expected_tokens', expected_tokens.shape, expected_tokens)
-                outputs = self.llm(input_ids=combined_input, attention_mask=combined_mask)                   # BK x (S+L+i) x V
-                # print('outputs[logits]', outputs['logits'].shape)
-                last_outputs = outputs['logits'][:, -1, :]           # BK x V
-                # print('last_outputs', last_outputs.shape, last_outputs)
-                scores = last_outputs[torch.arange(B*K), expected_tokens] # BK x 1
+
+                # outputs = self.llm(input_ids=combined_input, attention_mask=combined_mask)                   # BK x (S+L+i) x V
+                #     # print('outputs[logits]', outputs['logits'].shape)
+                # last_outputs = outputs['logits'][:, -1, :]           # BK x V
+                # # print('last_outputs', last_outputs.shape, last_outputs)
+                # scores = last_outputs[torch.arange(B*K), expected_tokens] # BK x 1
+                # all_scores.append(scores)
+
+                # combined_input = torch.cat([combined_input, torch.unsqueeze(expected_tokens, 1)], dim=1) #BK x (S + L + i)
+                # combined_mask = torch.cat([combined_mask, torch.unsqueeze(expected_mask, 1)], dim=1)
+                # del expected_tokens, expected_mask, outputs, last_outputs
+                # torch.cuda.empty_cache()
+                
+                scores = []
+                split_factor = 10
+                for j in range(split_factor):
+                    # print(combined_input.shape, combined_input)
+                    # print(B*K//10*j, B*K//10*(j+1))
+                    # print(combined_input[B*K//10*j:B*K//10*(j+1),:].shape, combined_input[B*K//10*j:B*K//10*(j+1),:])
+                    # print(combined_mask[B*K//10*j:B*K//10*(j+1),:].shape, combined_mask[B*K//10*j:B*K//10*(j+1),:])
+                    outputs = self.llm(input_ids=combined_input[B*K//split_factor*j:B*K//split_factor*(j+1),:], attention_mask=combined_mask[B*K//split_factor*j:B*K//split_factor*(j+1),:])                   # BK x (S+L+i) x V
+                    # print('outputs[logits]', outputs['logits'].shape)
+                    last_outputs = outputs['logits'][:, -1, :]           # BK x V
+                    # print('last_outputs', last_outputs.shape, last_outputs)
+                    scores.append(last_outputs[torch.arange(B*K//split_factor), expected_tokens[B*K//split_factor*j:B*K//split_factor*(j+1)]]) # BK x 1
+                    del outputs, last_outputs
+                    torch.cuda.empty_cache()
+                scores = torch.cat(scores, dim=0)
                 # print('scores', scores.shape, scores)
                 # print('expected_tokens_mask', expected_tokens_mask)
                 scores = torch.where(expected_mask == 1, scores, torch.nan)
@@ -252,20 +286,24 @@ f'\nQuestion: {questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in d
 
                 combined_input = torch.cat([combined_input, torch.unsqueeze(expected_tokens, 1)], dim=1) #BK x (S + L + i)
                 combined_mask = torch.cat([combined_mask, torch.unsqueeze(expected_mask, 1)], dim=1)
-                del expected_tokens, expected_mask, outputs, last_outputs
+                del expected_tokens, expected_mask
                 torch.cuda.empty_cache()
+            print(3.3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
             all_scores = torch.stack([x for x in all_scores], dim=1)
             # print('all_scores', all_scores.shape, all_scores)
             all_scores = all_scores.reshape(B, K, -1)
             # print('all_scores', all_scores.shape, all_scores)
             all_scores = torch.nanmean(all_scores, dim=-1)
             # print('all_scores', all_scores.shape, all_scores)
-            del answers_input, answers_mask
+            del tokenized_queries, answers_input, answers_mask
             del expanded_answers_input, expanded_answers_mask, combined_input, combined_mask
             torch.cuda.empty_cache()
             return all_scores
 
     def training_step(self, batch, batch_idx):
+        torch.cuda.empty_cache()
+        opt = self.optimizers()
+        print(1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
         # TODO: Make this actually work with the dataset constructed above
         # Pre-Process data (moved from above in order to batch tokenize for efficiency)
         questions = batch['questions']
@@ -283,19 +321,31 @@ f'\nQuestion: {questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in d
         self.question_encoder = self.question_encoder.to(device)
         self.docs_encoder = self.docs_encoder.to(device)
         self.llm = self.llm.to(device)
-        
-        # Normalize the retrieval scores from the forward pass
-        # TODO: Apply the masks in the scoring process - currently no masks but still converges on single batch
+        self.llm.eval()
+        print(1.01, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
-        reranker_output = self(tokenized_questions, tokenized_docs)  # output is retrieval scores?
-        rerank_dist = torch.nn.functional.log_softmax(reranker_output, dim=1)
-        
-        # Run an LLM to get the NLLs - NLLs or is it just the logits??
+        print("1.1 size of inputs:", tokenized_questions['input_ids'].element_size()*tokenized_questions['input_ids'].nelement() + \
+              tokenized_docs['input_ids'].element_size()*tokenized_docs['input_ids'].nelement() + \
+              tokenized_answers['input_ids'].element_size()*tokenized_answers['input_ids'].nelement())
+
+
+        # Run an LLM to get the NLLs (logits?)
         # llm_output = self.llm_pass(tokenized_questions, tokenized_docs, tokenized_answers)
         # llm_dist = torch.nn.functional.softmax(llm_output, dim=1)
         llm_output = self.llm_pass_2(questions, docs, tokenized_answers)
         llm_dist = torch.nn.functional.softmax(llm_output, dim=1)
+        print(2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
         
+        torch.cuda.empty_cache()
+        print(3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+
+         # Normalize the retrieval scores from the forward pass
+        reranker_output = self(tokenized_questions, tokenized_docs)  # output is retrieval scores?
+        rerank_dist = torch.nn.functional.log_softmax(reranker_output, dim=1)
+        del tokenized_questions, tokenized_docs, reranker_output
+        
+        print(4, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+
         # print('rerank', rerank_dist.shape, rerank_dist)
         # print(rerank_dist)
         # print('llm', llm_dist.shape, llm_dist)
@@ -308,14 +358,18 @@ f'\nQuestion: {questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in d
         # print(loss)
         self.log('train_loss', loss.item(), on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=len(questions))
         wandb.log({'train_loss': loss.item()})
-        del tokenized_questions, tokenized_docs, tokenized_answers, reranker_output, rerank_dist, llm_output, llm_dist, lossfn
+        # opt.zero_grad()
+        del tokenized_answers, rerank_dist, llm_output, llm_dist, lossfn
         torch.cuda.empty_cache()
         return loss
 
     def configure_optimizers(self):
         params = list(self.question_encoder.parameters()) + list(self.docs_encoder.parameters())
         return torch.optim.AdamW(params, lr=1e-4)
-    
+
+    def validation_step(self, batch, batch_idx):
+        pass
+
     def inference(self, questions, docs, top_k):
         scores = self.forward(questions, docs)
         order = torch.argsort(scores, descending=True)
@@ -422,6 +476,7 @@ f"""
 Question: {questions[i]}?<|end|>
 <|assistant|>
 Answer:""" for i, doc in enumerate(docs)]
+            
         else:
             query = ["""Question: who was leander paes partner in the mixed doubles at the us open in 2008?
 Answer: Cara Black
@@ -440,6 +495,7 @@ f'For the final question, answer using the given contexts:\n' + \
 f'\nQuestion:{questions[i]}?\nAnswer:' for i, doc in enumerate(docs)]
         # print(query)
         tokenized_query = self.tokenizer(query, padding=True, return_tensors='pt').to(device)
+        print(tokenized_query['input_ids'].shape)
         outputs = self.llm.generate(**tokenized_query, max_new_tokens=16, tokenizer=self.tokenizer, stop_strings=['\n'])
         # print(outputs.shape)
         outputs = outputs[:,len(tokenized_query['input_ids'][0]):]
@@ -452,11 +508,12 @@ f'\nQuestion:{questions[i]}?\nAnswer:' for i, doc in enumerate(docs)]
         # quit(0)
         return decoded_outputs
 
-    def eval(self, valid_loader, top_k, rerank=True):
+    def evaluate(self, valid_loader, top_k, rerank=True):
         temp = 1
         bleu = evaluate.load('bleu')
         bertscore = evaluate.load('bertscore')
         chrf = evaluate.load('chrf')
+        em = evaluate.load('exact_match')
         predictions = []
         references = []
 
@@ -535,6 +592,8 @@ f'\nQuestion:{questions[i]}?\nAnswer:' for i, doc in enumerate(docs)]
         bleu_results = bleu.compute(predictions=predictions, references=references)
         bertscore_results = bertscore.compute(predictions=predictions, references=references, lang='en')
         chrf_results = chrf.compute(predictions=predictions, references=references, word_order=1)
+        em_results = em.compute(predictions=predictions, references=list(np.asarray(references).flatten()), ignore_case=True, ignore_punctuation=True)
         print(bleu_results)
         print(bertscore_results)
         print(chrf_results)
+        print(em_results)

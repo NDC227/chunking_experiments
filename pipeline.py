@@ -38,6 +38,7 @@ args = argp.parse_args()
 
 os.environ["WANDB_INIT_TIMEOUT"] = "300"
 os.environ['HF_TOKEN'] = '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'
+torch.set_float32_matmul_precision('medium')
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # train_dataset = load_dataset('json', data_files=f'data/{args.train_set}.json')['train']
@@ -61,7 +62,7 @@ if args.train:
         valid_dataset = Dataset.from_dict(valid_dataset[:20])
         
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=batch_size)
     # train_loader = DataLoader(train_dataset, batch_size=batch_size)
     # valid_loader = DataLoader(valid_dataset, batch_size=batch_size)
 
@@ -70,6 +71,7 @@ if args.train:
         # set the wandb project where this run will be logged
         entity='ndc227-stanford-university',
         project='chunking_experiments',
+        group='fsdp_run',
 
         # track hyperparameters and run metadata
         config={
@@ -80,10 +82,10 @@ if args.train:
         }
     )
 
-    if args.num_gpus > 1:
-        trainer = L.Trainer(max_epochs=args.train_epochs, accelerator='gpu', devices=args.num_gpus)
+    if args.num_gpus > 0:
+        trainer = L.Trainer(max_epochs=args.train_epochs, accelerator='gpu', devices=args.num_gpus, default_root_dir="/nlp/scr/ayc227/lightning_logs")
     else:
-        trainer = L.Trainer(max_epochs=args.train_epochs)
+        trainer = L.Trainer(max_epochs=args.train_epochs, default_root_dir="/nlp/scr/ayc227/lightning_logs")
     trainer.fit(model, train_loader, valid_loader)
     if args.save:
         model.push_to_hub('ndc227/reranker_basic3', private=True)
@@ -91,16 +93,16 @@ if args.train:
 if args.eval:
     if not args.baseline:
         model = ReplugTransformer.from_pretrained("ndc227/reranker_basic2")
-    # valid_dataset = load_dataset(f'ndc227/{args.valid_set}', streaming=True)['train']
-    valid_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')['test']
-    # valid_dataset = valid_dataset.shuffle()
+    # eval_dataset = load_dataset(f'ndc227/{args.valid_set}', streaming=True)['train']
+    eval_dataset = load_dataset(f'ndc227/{args.dataset}', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')['test']
+    # eval_dataset = eval_dataset.shuffle()
 
     if args.tiny:
-        valid_dataset = Dataset.from_dict(valid_dataset[:20])
+        eval_dataset = Dataset.from_dict(eval_dataset[:20])
         
-    valid_loader = DataLoader(valid_dataset, shuffle=True, batch_size=batch_size)
+    eval_loader = DataLoader(eval_dataset, batch_size=batch_size)
 
     if args.baseline:
-        model.eval(valid_loader, top_k=args.eval_k, rerank=False)
+        model.evaluate(eval_loader, top_k=args.eval_k, rerank=False)
     else:
-        model.eval(valid_loader, top_k=args.eval_k)
+        model.evaluate(eval_loader, top_k=args.eval_k)
