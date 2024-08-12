@@ -128,14 +128,14 @@ f'\nQuestion: {questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in d
         combined_mask = tokenized_queries['attention_mask'] # BK x (S + L)
         # print('combined_input', combined_input.shape)
         expanded_answers_input = expand_data(answers_input, B, K)
-        expanded_answers_mask = expand_data(answers_mask, B, K)
+        # expanded_answers_mask = expand_data(answers_mask, B, K)
         # print('expanded_answers_input', expanded_answers_input.shape, expanded_answers_input)
         all_scores = []
         for i in range(answer_length):
             print(3.2, torch.cuda.mem_get_info(device), i, torch.cuda.memory_reserved(device), torch.cuda.memory_allocated(device))
             # print('combined_input', combined_input.shape)
             expected_tokens = expanded_answers_input[:, i]        # BK x 1
-            expected_mask = expanded_answers_mask[:, i]           # BK x 1
+            # expected_mask = expanded_answers_mask[:, i]           # BK x 1
             # print('expected_tokens', expected_tokens.shape, expected_tokens)
 
             # outputs = self.llm(input_ids=combined_input, attention_mask=combined_mask)                   # BK x (S+L+i) x V
@@ -151,7 +151,7 @@ f'\nQuestion: {questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in d
             # torch.cuda.empty_cache()
             
             scores = []
-            split_factor = 10
+            split_factor = 100
             j = 0
             while B*K//split_factor*j < B*K:
                 start = B*K//split_factor*j
@@ -176,13 +176,13 @@ f'\nQuestion: {questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in d
             scores = torch.cat(scores, dim=0) # BK x 1
             # print('scores', scores.shape)
             # print('expected_mask', expected_mask.shape)
-            scores = torch.where(expected_mask == 1, scores, torch.nan)
+            # scores = torch.where(expected_mask == 1, scores, torch.nan)
             # print('scores', scores.shape, scores)
             all_scores.append(scores)
 
             combined_input = torch.cat([combined_input, expected_tokens.unsqueeze(1)], dim=1) #BK x (S + L + i)
-            combined_mask = torch.cat([combined_mask, expected_mask.unsqueeze(1)], dim=1)
-            del expected_tokens, expected_mask
+            combined_mask = torch.cat([combined_mask, torch.ones(expected_tokens.unsqueeze(1).shape).to(device)], dim=1)
+            del expected_tokens#, expected_mask
             torch.cuda.empty_cache()
         print(3.3, torch.cuda.mem_get_info(device), torch.cuda.memory_reserved(device), torch.cuda.memory_allocated(device))
         all_scores = torch.stack([x for x in all_scores], dim=1)
@@ -192,7 +192,7 @@ f'\nQuestion: {questions[i]}?\nAnswer:' for i, doc in enumerate(docs) for d in d
         all_scores = torch.nanmean(all_scores, dim=-1) # B x K
         print('all_scores', all_scores.shape, all_scores)
         del tokenized_queries, answers_input, answers_mask
-        del expanded_answers_input, expanded_answers_mask, combined_input, combined_mask
+        del combined_input, combined_mask, expanded_answers_input#, expanded_answers_mask
         torch.cuda.empty_cache()
         return all_scores
     
@@ -312,7 +312,7 @@ f'\nQuestion: {questions[i]}?\nAnswer:' for i in range(len(docs))]
             # torch.cuda.empty_cache()
             outputs = llm(input_ids=combined_input, 
                           attention_mask=combined_mask)                   # BK x (S+L+i) x V
-            # print('outputs[logits]', outputs['logits'].shape)
+            print('outputs[logits]', outputs['logits'].shape)
             # print('outputs[logits]', outputs['logits'].shape)
             # print('combined_input size', combined_input.element_size()*combined_input.nelement())
             # print('outputs size', outputs['logits'].element_size()*outputs['logits'].nelement())
@@ -351,7 +351,7 @@ def score_chunks(ex, rank):
     llm.to(device)
     questions = [ex['questions']]
     # print(questions)
-    docs = [ex['new_chunks'][:97]]
+    docs = [ex['new_chunks']]
     answers = [ex['answers']]
     tokenized_answers = tokenizer(answers, padding=True, return_tensors='pt').to(device)
     llm_output = llm_pass(questions, docs, tokenized_answers, device)
@@ -381,6 +381,7 @@ else:
     train_chunks = load_dataset(f'ndc227/{args.dataset}', split='train', num_proc=torch.cuda.device_count(), cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
 
 tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+tokenizer.padding_side = 'left'
 if model_id.startswith('facebook'):
     llm = AutoModelForCausalLM.from_pretrained(model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
 else:
@@ -389,17 +390,26 @@ else:
 llm.eval()
 
 def flatten_chunks(batch, rank):
+    down_sample = 100
+    # print(batch['new_chunks'])
+    idxs = [np.random.choice(len(batch['new_chunks'][i]), size=(down_sample), replace=False) for i in range(len(batch['new_chunks']))]
+    # print(idxs)
     new_batch = {}
-    new_batch['questions'] = [questions for i, questions in enumerate(batch['questions']) for _ in batch['new_chunks'][i]]
-    new_batch['answers'] = [answers for i, answers in enumerate(batch['answers']) for _ in batch['new_chunks'][i]]
-    new_batch['new_chunks'] = [chunk for chunks in batch['new_chunks'] for chunk in chunks]
-    new_batch['chunker_ids'] = [chunk for chunks in batch['chunker_ids'] for chunk in chunks]
-    # print(new_batch)
+    new_batch['questions'] = [questions for i, questions in enumerate(batch['questions']) for _ in range(down_sample)]
+    new_batch['answers'] = [answers for i, answers in enumerate(batch['answers']) for _ in range(down_sample)]
+    
+    new_batch['new_chunks'] = [chunks[idx] for i, chunks in enumerate(batch['new_chunks']) for idx in idxs[i]]
+    new_batch['chunker_ids'] = [chunks[idx] for i, chunks in enumerate(batch['chunker_ids']) for idx in idxs[i]]
+    # print(len(new_batch['new_chunks']))
+    # quit(0)
     return new_batch
 
 def merge_chunks(ex):
     question = ex['questions']
-    ex['llm_scores'] = flat_train_chunks.filter(lambda x: x['questions']==question)['llm_scores']
+    filtered_flat_chunks = flat_train_chunks.filter(lambda x: x['questions']==question)
+    ex['new_chunks'] = filtered_flat_chunks['new_chunks']
+    ex['chunker_ids'] = filtered_flat_chunks['chunker_ids']
+    ex['llm_scores'] = filtered_flat_chunks['llm_scores']
     return ex
 
 
@@ -417,6 +427,7 @@ if __name__ == '__main__':
 
     train_chunks = train_chunks.map(merge_chunks, num_proc=torch.cuda.device_count())
     print(train_chunks)
+    print(len(train_chunks[0]['new_chunks']))
 
     train_chunks.push_to_hub(f'ndc227/toy_{args.output_name}', private=True)
     print('done uploading to hub')
