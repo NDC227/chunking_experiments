@@ -24,6 +24,7 @@ argp.add_argument('--num_proc', default=1, type=int)
 argp.add_argument('--batch_size', default=2, type=int)
 argp.add_argument('--max_seq_length', default=400, type=int)
 argp.add_argument('--tiny', action='store_true')
+argp.add_argument('--downsample', default=100, type=int)
 args = argp.parse_args()
 
 num_proc = args.num_proc
@@ -390,13 +391,12 @@ else:
 llm.eval()
 
 def flatten_chunks(batch, rank):
-    down_sample = 100
     # print(batch['new_chunks'])
-    idxs = [np.random.choice(len(batch['new_chunks'][i]), size=(down_sample), replace=False) for i in range(len(batch['new_chunks']))]
+    idxs = [np.random.choice(len(batch['new_chunks'][i]), size=(args.downsample), replace=False) for i in range(len(batch['new_chunks']))]
     # print(idxs)
     new_batch = {}
-    new_batch['questions'] = [questions for i, questions in enumerate(batch['questions']) for _ in range(down_sample)]
-    new_batch['answers'] = [answers for i, answers in enumerate(batch['answers']) for _ in range(down_sample)]
+    new_batch['questions'] = [questions for i, questions in enumerate(batch['questions']) for _ in range(args.downsample)]
+    new_batch['answers'] = [answers for i, answers in enumerate(batch['answers']) for _ in range(args.downsample)]
     
     new_batch['new_chunks'] = [chunks[idx] for i, chunks in enumerate(batch['new_chunks']) for idx in idxs[i]]
     new_batch['chunker_ids'] = [chunks[idx] for i, chunks in enumerate(batch['chunker_ids']) for idx in idxs[i]]
