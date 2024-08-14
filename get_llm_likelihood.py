@@ -204,7 +204,8 @@ def llm_batch_pass(questions, docs, answers, device):
         # print(B)
         if model_id.startswith('meta-llama'):
             queries = [f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-You are an assistant who gives short, succinct answers to questions. Please answer according to the following examples:<|eot_id|>
+You are an assistant who gives short, succinct answers to questions. Please answer the following questions using the context given below: 
+Context: {docs[i]}<|eot_id|>
 
 <|start_header_id|>user<|end_header_id|>
 Question: who was leander paes partner in the mixed doubles at the us open in 2008?<|eot_id|>
@@ -227,15 +228,34 @@ Question: when did the name of persia change to iran?<|eot_id|>
 Answer: 1935<|eot_id|>
 
 <|start_header_id|>user<|end_header_id|>
-For the final question, use the following context to answer the question.
-Context: {docs[i]}
+Question: the common name for a modulator demodulator is?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: modem<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+Question: what is the term for how steep a line is in math?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: slope or gradient<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+Question: how many ep are there in sacred games?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: 8<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
+Question: neo malthusians believe that the solution to poverty is?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Answer: abstinence , delayed marriage<|eot_id|>
+
+<|start_header_id|>user<|end_header_id|>
 Question: {questions[i]}?<|eot_id|>
 <|start_header_id|>assistant<|end_header_id|>
 Answer:""" for i in range(len(docs))]
             
         elif model_id.startswith('microsoft'):
             queries = [f"""<|system|>
-You are an assistant who gives short, succinct answers to questions. Please answer according to the following examples:<|end|>
+You are an assistant who gives short, succinct answers to questions. Please answer the following questions using the contexts given below: 
+Context: {docs[i]}<|end|>
 <|user|>
 Question: who was leander paes partner in the mixed doubles at the us open in 2008?<|end|>
 <|assistant|>
@@ -253,28 +273,28 @@ Question: when did the name of persia change to iran?<|end|>
 <|assistant|>
 Answer: 1935<|end|>
 <|user|>
-For the final question, use the following context to answer the question.
-Context: {docs[i]}
 Question: {questions[i]}?<|end|>
 <|assistant|>
 Answer:""" for i in range(len(docs))]
             
         else:
-            queries = ["""Question: who was leander paes partner in the mixed doubles at the us open in 2008?
+            queries = [f"""You are an assistant who gives short, succinct answers to questions. Please answer the following questions using the contexts given below:
+Context: {docs[i]}
+                       
+Question: who was leander paes partner in the mixed doubles at the us open in 2008?
 Answer: Cara Black
 
 Question: who takes over after a president is impeached?
 Answer: vice president
-                        
+
 Question: who plays the dogs voice in downward dog?
 Answer: Samm Hodges
-                        
+
 Question: when did the name of persia change to iran?
 Answer: 1935
-""" + \
-f'For the final question, answer using the given context:\n' + \
-f'Context: {docs[i]}' + \
-f'\nQuestion: {questions[i]}?\nAnswer:' for i in range(len(docs))]
+
+Question:{questions[i]}?
+Answer:""" for i in range(len(docs))]
         
         # queries = [['Please answer the following question using the following context. The answer should not restate the question.\n\nContext: ' + d + '\n\nQuestion: ' + questions[i] + '?\n\nVery short answer:' for d in doc] for i, doc in enumerate(docs)]
         # queries = [q for query in queries for q in query]
@@ -376,7 +396,7 @@ def score_chunks_batch(batch, rank):
     return batch
 
 if args.tiny:
-    train_chunks = load_dataset(f'ndc227/{args.dataset}', split='train', streaming=True, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets').take(20)
+    train_chunks = load_dataset(f'ndc227/{args.dataset}', split='train', streaming=True, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets').take(100)
     train_chunks = Dataset.from_generator(lambda: (yield from train_chunks), features=train_chunks.features)
 else:
     train_chunks = load_dataset(f'ndc227/{args.dataset}', split='train', num_proc=torch.cuda.device_count(), cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
@@ -420,7 +440,7 @@ if __name__ == '__main__':
     # train_chunks = train_chunks.map(score_chunks, with_rank=True, num_proc=torch.cuda.device_count())
 
     flat_train_chunks = train_chunks.map(flatten_chunks, batched=True, batch_size=16, with_rank=True, num_proc=torch.cuda.device_count())
-    print(train_chunks)
+    print(flat_train_chunks)
     
     flat_train_chunks = flat_train_chunks.map(score_chunks_batch, batched=True, batch_size=args.batch_size, with_rank=True, num_proc=torch.cuda.device_count())
     print(flat_train_chunks)
@@ -429,5 +449,5 @@ if __name__ == '__main__':
     print(train_chunks)
     print(len(train_chunks[0]['new_chunks']))
 
-    train_chunks.push_to_hub(f'ndc227/toy_{args.output_name}', private=True)
+    train_chunks.push_to_hub(f'ndc227/toy_toy_{args.output_name}', private=True)
     print('done uploading to hub')
