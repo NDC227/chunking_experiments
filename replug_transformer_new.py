@@ -1,7 +1,7 @@
 import numpy as np
 from transformers import AutoTokenizer
 import wandb
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoModel, AutoModelForSequenceClassification
 import torch
 import torch.nn as nn
 import lightning as L
@@ -42,8 +42,10 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         self.tokenizer.padding_side = 'left'
         self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.vocab_size = len(self.tokenizer)
-        self.question_encoder = Encoder(self.vocab_size)
-        self.docs_encoder = Encoder(self.vocab_size)
+        # self.question_encoder = Encoder(self.vocab_size)
+        # self.docs_encoder = Encoder(self.vocab_size)
+        self.reranker = AutoModel.from_pretrained('BAAI/bge-m3', cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+        self.reranker_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-m3')
         self.add_ids = False
         self.length_penalty = 0.0
     
@@ -85,6 +87,25 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
 
         return d_scores
     
+    def reranker_forward(self, questions, docs):
+        inputs = self.reranker_tokenizer(questions, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+        scores = self.reranker(**inputs, return_dict=True)[0][:, 0]
+        query_embeddings = torch.nn.functional.normalize(scores, p=2, dim=1)
+        query_embeddings = query_embeddings.unsqueeze(1)
+        # print(query_embeddings)
+        docs = [d for doc in docs for d in doc]
+        inputs = self.reranker_tokenizer(docs, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+        scores = self.reranker(**inputs, return_dict=True)[0][:, 0]
+        doc_embeddings = torch.nn.functional.normalize(scores, p=2, dim=1)
+        BK, L = doc_embeddings.shape
+        doc_embeddings = torch.transpose(torch.reshape(doc_embeddings, (len(questions), -1, L)), 1, 2)
+        # print(doc_embeddings.shape, doc_embeddings)
+        # print('dims', query_embeddings.shape, doc_embeddings.shape)
+        scores = torch.bmm(query_embeddings, doc_embeddings)
+        scores = torch.squeeze(scores)
+        # print('scores', scores)
+        return scores
+    
     def expand_data(self, data, batch_size, num_docs):                   # Data: B x S
         expanded_data = torch.unsqueeze(data, 1)                         # B x 1 x S
         expanded_data = expanded_data.expand(-1, num_docs, -1)           # B x K x S
@@ -101,24 +122,26 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         answers = batch['answers']
         # print('questions', questions)
         # print('answers', answers)
-        tokenized_questions = self.tokenizer(questions, padding=True, return_tensors='pt').to(device)
+        # tokenized_questions = self.tokenizer(questions, padding=True, return_tensors='pt').to(device)
         # tokenized_docs = self.tokenizer([x for retr in docs for x in retr], padding='max_length', truncation=True, max_length=600, return_tensors='pt').to(device)
         # print([chunker_ids[i][j] + ' ' + x for i, retr in enumerate(docs) for j, x in enumerate(retr)][:2])
-        if self.add_ids:
-            tokenized_docs = self.tokenizer([chunker_ids[i][j] + ' ' + x for i, retr in enumerate(docs) for j, x in enumerate(retr)], padding=True, return_tensors='pt').to(device)
-        else:
-            tokenized_docs = self.tokenizer([x for retr in docs for x in retr], padding=True, return_tensors='pt').to(device)
-        tokenized_docs['input_ids'] = torch.transpose(torch.reshape(tokenized_docs['input_ids'], (len(docs), len(docs[0]), -1)), 0, 1)
-        tokenized_docs['attention_mask'] = torch.transpose(torch.reshape(tokenized_docs['attention_mask'], (len(docs), len(docs[0]), -1)), 0, 1)
-        tokenized_answers = self.tokenizer(answers, padding=True, return_tensors='pt').to(device)
+        # if self.add_ids:
+        #     tokenized_docs = self.tokenizer([chunker_ids[i][j] + ' ' + x for i, retr in enumerate(docs) for j, x in enumerate(retr)], padding=True, return_tensors='pt').to(device)
+        # else:
+        #     tokenized_docs = self.tokenizer([x for retr in docs for x in retr], padding=True, return_tensors='pt').to(device)
+        # tokenized_docs['input_ids'] = torch.transpose(torch.reshape(tokenized_docs['input_ids'], (len(docs), len(docs[0]), -1)), 0, 1)
+        # tokenized_docs['attention_mask'] = torch.transpose(torch.reshape(tokenized_docs['attention_mask'], (len(docs), len(docs[0]), -1)), 0, 1)
+        # tokenized_answers = self.tokenizer(answers, padding=True, return_tensors='pt').to(device)
         # quit(0)
-        self.question_encoder = self.question_encoder.to(device)
-        self.docs_encoder = self.docs_encoder.to(device)
+        # self.question_encoder = self.question_encoder.to(device)
+        # self.docs_encoder = self.docs_encoder.to(device)
+        self.reranker = self.reranker.to(device)
+        self.reranker.train()
         print(1.01, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
-        print("1.1 size of inputs:", tokenized_questions['input_ids'].element_size()*tokenized_questions['input_ids'].nelement() + \
-              tokenized_docs['input_ids'].element_size()*tokenized_docs['input_ids'].nelement() + \
-              tokenized_answers['input_ids'].element_size()*tokenized_answers['input_ids'].nelement())
+        # print("1.1 size of inputs:", tokenized_questions['input_ids'].element_size()*tokenized_questions['input_ids'].nelement() + \
+        #       tokenized_docs['input_ids'].element_size()*tokenized_docs['input_ids'].nelement() + \
+        #       tokenized_answers['input_ids'].element_size()*tokenized_answers['input_ids'].nelement())
 
 
         # Run an LLM to get the NLLs (logits?)
@@ -142,9 +165,13 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         
         # print(3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
         # Normalize the retrieval scores from the forward pass
-        reranker_output = self(tokenized_questions, tokenized_docs)  # output is retrieval scores?
+        # reranker_output = self(tokenized_questions, tokenized_docs)  # output is retrieval scores?
+        reranker_output = self.reranker_forward(questions, docs)
         rerank_dist = torch.nn.functional.log_softmax(reranker_output, dim=1)
-        del tokenized_questions, tokenized_docs, reranker_output
+        print('rerank', rerank_dist.shape, rerank_dist)
+        # quit(0)
+        del reranker_output
+        # del tokenized_questions, tokenized_docs, tokenized_answers
         torch.cuda.empty_cache()
         
         print(4, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
@@ -160,12 +187,14 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         self.log('train_loss', loss.item(), on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=len(questions))
         # wandb.log({'train_loss': loss.item()})
         # opt.zero_grad()
-        del tokenized_answers, rerank_dist, llm_dist, lossfn
+        # quit(0)
+        del rerank_dist, llm_dist, lossfn
         torch.cuda.empty_cache()
         return loss
 
     def configure_optimizers(self):
-        params = list(self.question_encoder.parameters()) + list(self.docs_encoder.parameters())
+        # params = list(self.question_encoder.parameters()) + list(self.docs_encoder.parameters())
+        params = self.reranker.parameters()
         return torch.optim.AdamW(params, lr=1e-4)
 
     def validation_step(self, batch, batch_idx):
@@ -293,9 +322,13 @@ Answer:""" for i, doc in enumerate(docs)]
         # quit(0)
         return decoded_outputs
 
-    def evaluate(self, valid_loader, top_k, rerank=True):
+    def evaluate(self, valid_loader, top_k, experiment, rerank=True):
         with torch.no_grad():
-            self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+            if self.model_id.startswith('facebook'):
+                self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+            else:
+                self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models', 
+                                                        torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
             self.llm.resize_token_embeddings(self.vocab_size)
             temp = 1
             # bleu = evaluate.load('bleu')
@@ -305,24 +338,59 @@ Answer:""" for i, doc in enumerate(docs)]
             predictions = []
             references = []
 
-            self.question_encoder.to(device)
-            self.docs_encoder.to(device)
+            # self.question_encoder.to(device)
+            # self.docs_encoder.to(device)
             self.llm.to(device)
-            self.question_encoder.eval()
-            self.docs_encoder.eval()
+            # self.question_encoder.eval()
+            # self.docs_encoder.eval()
             self.llm.eval()
             for batch in tqdm(valid_loader):
                 print(1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
                 questions = batch['questions']
-                docs = batch['new_chunks']
-                chunker_ids = batch['chunker_ids']
-                answers = batch['answers']
+                if experiment == '1' or experiment == '1.5':
+                    docs = batch['retrieved']
+                    answers = batch['answers']
+                else:
+                    docs = batch['new_chunks']
+                    chunker_ids = batch['chunker_ids']
+                    answers = batch['answers']
                 # print(np.asarray(questions).shape, np.asarray(docs).shape)
                 # questions = ['When was the original Transformers movie released', 'What is the primary ingredient in Tabasco sauce']
                 # docs = [['The first Transformers movie was released in 2007.', 'Tabasco sauce is composed mostly of vinegar, by volume.'], 
                 #         ['Jurassic Park is a 1993 movie directed by Steven Spielberg', 'Potatoes are a starchy root vegetable.']]
                 # answers = ['2007', 'vinegar']
                 
+                if experiment == '1':
+                    # print(len(docs), len(docs[0]))
+                    new_docs = np.asarray(docs)[:top_k, :].T
+                    # print(new_docs)
+                elif experiment == '1.5' or experiment == '2' or experiment == '3':
+                    self.reranker_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-m3', cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+                    self.reranker = AutoModel.from_pretrained('BAAI/bge-m3', cache_dir='/nlp/scr/ayc227/.cache/huggingface/models').to(device)
+                    self.reranker.eval()
+                    docs = np.asarray(docs).T
+                    new_docs = []
+                    for i in range(len(questions)):
+                        # print(questions[i])
+                        # print(list(docs[i]))
+                        with torch.no_grad():
+                            tokenized_question = self.reranker_tokenizer(questions[i], padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+                            query_scores = self.reranker(**tokenized_question, return_dict=True)[0][:, 0]
+                            query_embeddings = torch.nn.functional.normalize(query_scores, p=2, dim=1)
+                            tokenized_docs = self.reranker_tokenizer(list(docs[i]), padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+                            docs_scores = self.reranker(**tokenized_docs, return_dict=True)[0][:, 0]
+                            docs_embeddings = torch.nn.functional.normalize(docs_scores, p=2, dim=1)
+                            scores = (query_embeddings @ docs_embeddings.T)[0]
+                            ranking = torch.argsort(scores, dim=0, descending=True)
+                            # print(ranking)
+                            top_k_docs = np.take(np.asarray(docs[i]), ranking[:top_k].cpu().numpy(), axis=0)
+                            new_docs.append(list(top_k_docs))
+                        del tokenized_question, tokenized_docs, query_scores, docs_scores, query_embeddings, docs_embeddings, scores, ranking
+                        # quit(0)
+                    print([len(docs) for docs in new_docs])
+                    # quit(0)                    
+                    
+
                 if rerank:
                     tokenized_questions = self.tokenizer(questions, padding=True, return_tensors='pt').to(device)
                     # tokenized_docs = self.tokenizer([x for retr in docs for x in retr], padding=True, return_tensors='pt').to(device)
@@ -343,11 +411,8 @@ Answer:""" for i, doc in enumerate(docs)]
                     del tokenized_questions, tokenized_docs, rerank_scores, rerank_order
                     torch.cuda.empty_cache()
                     
-                else:
-                    # print(len(docs), len(docs[0]))
-                    new_docs = np.asarray(docs)[:top_k, :].T
-                    # print(new_docs)
-                    # print(len(new_docs), len(new_docs[0]))
+                #     print(len(new_docs), len(new_docs[0]), len(new_docs[0][0].split(' ')))
+                # quit(0)
                 # preds = self.ensemble_predict(tokenized_queries, rerank_scores) # B x len(P)
                 print(2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
                 preds = self.ensemble_predict(questions, new_docs)

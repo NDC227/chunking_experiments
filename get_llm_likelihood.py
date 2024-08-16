@@ -300,6 +300,7 @@ Answer:""" for i in range(len(docs))]
         # queries = [q for query in queries for q in query]
         # print(queries[:2])
         # quit(0)
+        tokenizer.padding_side = 'left'
         tokenized_queries = tokenizer(queries, padding=True, truncation=True, max_length=args.max_seq_length, return_tensors='pt').to(device)
         answers_input, answers_mask = answers['input_ids'], answers['attention_mask'].to(dtype=torch.bool) # B x A
         # print('answers_input', answers_input.shape, answers_input)
@@ -314,7 +315,7 @@ Answer:""" for i in range(len(docs))]
         # print('expanded_answers_mask', expanded_answers_mask)
         all_scores = []
         for i in range(answer_length):
-            print(3.2, torch.cuda.mem_get_info(device), i, torch.cuda.memory_reserved(device), torch.cuda.memory_allocated(device))
+            # print(3.2, torch.cuda.mem_get_info(device), i, torch.cuda.memory_reserved(device), torch.cuda.memory_allocated(device))
             # print('combined_input', combined_input.shape)
             expected_tokens = answers_input[:, i]             # B x 1
             expected_mask = answers_mask[:, i]   # B x 1
@@ -333,11 +334,11 @@ Answer:""" for i in range(len(docs))]
             # torch.cuda.empty_cache()
             outputs = llm(input_ids=combined_input, 
                           attention_mask=combined_mask)                   # BK x (S+L+i) x V
-            print('outputs[logits]', outputs['logits'].shape)
+            # print('outputs[logits]', outputs['logits'].shape)
             # print('outputs[logits]', outputs['logits'].shape)
             # print('combined_input size', combined_input.element_size()*combined_input.nelement())
             # print('outputs size', outputs['logits'].element_size()*outputs['logits'].nelement())
-            print('3.2.1', torch.cuda.mem_get_info(device), i, torch.cuda.memory_reserved(device), torch.cuda.memory_allocated(device))
+            # print('3.2.1', torch.cuda.mem_get_info(device), i, torch.cuda.memory_reserved(device), torch.cuda.memory_allocated(device))
             # quit(0)
             last_outputs = outputs['logits'][:, -1, :]           # BK x V
             # print('last_outputs', last_outputs.shape)
@@ -388,6 +389,7 @@ def score_chunks_batch(batch, rank):
     # print(questions)
     docs = batch['new_chunks']
     answers = batch['answers']
+    tokenizer.padding_side = 'right'
     tokenized_answers = tokenizer(answers, padding=True, return_tensors='pt').to(device)
     llm_output = llm_batch_pass(questions, docs, tokenized_answers, device)
     # llm_dist = torch.nn.functional.softmax(llm_output, dim=1)
@@ -396,18 +398,20 @@ def score_chunks_batch(batch, rank):
     return batch
 
 if args.tiny:
-    train_chunks = load_dataset(f'ndc227/{args.dataset}', split='train', streaming=True, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets').take(100)
+    train_chunks = load_dataset(f'ndc227/{args.dataset}', split='train', streaming=True, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets').take(10)
     train_chunks = Dataset.from_generator(lambda: (yield from train_chunks), features=train_chunks.features)
 else:
     train_chunks = load_dataset(f'ndc227/{args.dataset}', split='train', num_proc=torch.cuda.device_count(), cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
 
 tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
-tokenizer.padding_side = 'left'
+tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+
 if model_id.startswith('facebook'):
     llm = AutoModelForCausalLM.from_pretrained(model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
 else:
     llm = AutoModelForCausalLM.from_pretrained(model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models', 
                                                torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+llm.resize_token_embeddings(len(tokenizer))
 llm.eval()
 
 def flatten_chunks(batch, rank):

@@ -2,7 +2,7 @@ import argparse
 from datasets import load_dataset
 import os
 from torch.utils.data import DataLoader
-from datasets import Dataset
+from datasets import Dataset, get_dataset_config_names
 import wandb
 import torch.cuda
 import lightning as L
@@ -13,10 +13,16 @@ from replug_transformer_new import ReplugTransformer
 # Sample use
 # python new_pipeline.py --llm_name facebook/opt-125m --train --tiny --dataset toy_rechunked_and_scored_nq --train_epochs 2 --batch_size 2
 # python new_pipeline.py --llm_name facebook/opt-125m --eval --tiny --baseline --batch_size 2 --dataset rechunked_nq --eval_k 10
+# python new_pipeline.py --llm_name facebook/opt-125m --eval --eval_experiment 1 --tiny --batch_size 2 --dataset new_chunks_with_retrieve --eval_k 10
+# python new_pipeline.py --llm_name facebook/opt-125m --eval --eval_experiment 1.5 --tiny --batch_size 2 --dataset new_chunks_with_retrieve --eval_k 10
+# python new_pipeline.py --llm_name facebook/opt-125m --eval --eval_experiment 2 --tiny --batch_size 1 --dataset test_rechunked --exp2_subset RecursiveCharacterTextSplitter_250_0 --eval_k 10
+# python new_pipeline.py --llm_name facebook/opt-125m --eval --eval_experiment 3 --tiny --batch_size 1 --dataset test_rechunked --eval_k 10
 argp = argparse.ArgumentParser()
 argp.add_argument('--llm_name', default='facebook/opt-125m')
 argp.add_argument('--train', action='store_true')
 argp.add_argument('--eval', action='store_true')
+argp.add_argument('--eval_experiment', default='1')
+argp.add_argument('--exp2_subset', default='')
 argp.add_argument('--tiny', action='store_true')
 argp.add_argument('--save', action='store_true')
 argp.add_argument('--baseline', action='store_true')
@@ -46,7 +52,7 @@ batch_size = args.batch_size
 model = ReplugTransformer(model_id)
 
 def sample_docs(ex):
-    idxs = torch.randint(len(ex['new_chunks']), (100,))
+    idxs = torch.randint(len(ex['new_chunks']), (10,))
     ex['new_chunks'] = np.take(ex['new_chunks'],idxs)
     ex['chunker_ids'] = np.take(ex['chunker_ids'],idxs)
     ex['llm_scores'] = np.take(ex['llm_scores'],idxs)
@@ -56,6 +62,13 @@ def downsample_eval(ex):
     idxs = torch.randint(len(ex['new_chunks']), (100,))
     ex['new_chunks'] = np.take(ex['new_chunks'],idxs)
     ex['chunker_ids'] = np.take(ex['chunker_ids'],idxs)
+    return ex
+
+def combine_subsets(ex):
+    # print(ex['idx'])
+    for i in range(1, len(subsets)):
+        ex['new_chunks'].extend(subsets[i][ex['idx']]['new_chunks'])
+        ex['chunker_ids'].extend(subsets[i][ex['idx']]['chunker_ids'])
     return ex
 
 if args.train:
@@ -70,7 +83,7 @@ if args.train:
     if args.length_penalty > 0:
         model.length_penalty = args.length_penalty
 
-    # train_dataset = train_dataset.map(sample_docs, num_proc=torch.cuda.device_count())
+    train_dataset = train_dataset.map(sample_docs, num_proc=torch.cuda.device_count())
     # print(train_dataset[0])
     print(len(train_dataset[0]['new_chunks']))
 
@@ -101,12 +114,31 @@ if args.train:
         model.push_to_hub('ndc227/reranker_basic3', private=True)
 
 if args.eval:
-    if not args.baseline:
+    if args.eval_experiment == '4':
         model = ReplugTransformer.from_pretrained("ndc227/reranker_basic3")
     # eval_dataset = load_dataset(f'ndc227/{args.valid_set}', streaming=True)['train']
-    eval_dataset = load_dataset(f'ndc227/{args.dataset}', split='test', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
-    eval_dataset = eval_dataset.remove_columns('retrieved')
-    eval_dataset = eval_dataset.map(downsample_eval, num_proc=torch.cuda.device_count())
+    if args.eval_experiment == '1' or args.eval_experiment == '1.5':
+        eval_dataset = load_dataset(f'ndc227/{args.dataset}', split='test', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
+    elif args.eval_experiment == '2':
+        eval_dataset = load_dataset(f'ndc227/{args.dataset}', args.exp2_subset, split='test', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
+    elif args.eval_experiment == '3':
+        subsets = []
+        configs = get_dataset_config_names(f'ndc227/{args.dataset}')
+        # print(configs)
+        for config in configs:
+            eval_subset = load_dataset(f'ndc227/{args.dataset}', config, split='test', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
+            subsets.append(eval_subset)
+        # print(subsets)
+        eval_dataset = subsets[0]
+        eval_dataset = eval_dataset.add_column('idx', np.arange(len(eval_dataset)))
+        eval_dataset = eval_dataset.map(combine_subsets, num_proc=num_proc)
+        eval_dataset.remove_columns('idx')
+        # print(eval_dataset, len(eval_dataset[0]['new_chunks']))
+        # quit(0)
+    else:
+        eval_dataset = load_dataset(f'ndc227/{args.dataset}', split='test', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
+        eval_dataset = eval_dataset.remove_columns('retrieved')
+        eval_dataset = eval_dataset.map(downsample_eval, num_proc=torch.cuda.device_count())
     # eval_dataset = eval_dataset.shuffle()
 
     if args.tiny:
@@ -114,10 +146,10 @@ if args.eval:
         
     eval_loader = DataLoader(eval_dataset, batch_size=batch_size)
 
-    if args.baseline:
+    if args.eval_experiment != '4':
         # print(next(iter(eval_loader)))
         # print(len(next(iter(eval_loader))['retrieved']))
         # quit(0)
-        model.evaluate(eval_loader, top_k=args.eval_k, rerank=False)
+        model.evaluate(eval_loader, top_k=args.eval_k, experiment=args.eval_experiment, rerank=False)
     else:
-        model.evaluate(eval_loader, top_k=args.eval_k)
+        model.evaluate(eval_loader, top_k=args.eval_k, experiment=args.eval_experiment)
