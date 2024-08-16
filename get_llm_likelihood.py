@@ -16,7 +16,6 @@ torch.set_float32_matmul_precision('medium')
 # device = 'cuda' if torch.cuda.is_available else 'cpu'
 
 # python get_llm_likelihood.py --llm_name facebook/opt-125m --dataset rechunked_nq --output_name rechunked_and_scored_nq --tiny --max_seq_length 600 --batch_size 64
-# python get_llm_likelihood.py --user ContextualAI --llm_name meta-llama/Meta-Llama-3.1-8B-Instruct --dataset rechunked_nq --output_name rechunked_and_scored_nq --max_seq_length 600 --batch_size 32 
 argp = argparse.ArgumentParser()
 argp.add_argument('--llm_name', default='facebook/opt-125m')
 argp.add_argument('--dataset', default='rechunked_nq')
