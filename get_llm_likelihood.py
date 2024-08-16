@@ -16,9 +16,11 @@ torch.set_float32_matmul_precision('medium')
 # device = 'cuda' if torch.cuda.is_available else 'cpu'
 
 # python get_llm_likelihood.py --llm_name facebook/opt-125m --dataset rechunked_nq --output_name rechunked_and_scored_nq --tiny --max_seq_length 600 --batch_size 64
+# python get_llm_likelihood.py --user ContextualAI --llm_name meta-llama/Meta-Llama-3.1-8B-Instruct --dataset rechunked_nq --output_name rechunked_and_scored_nq --max_seq_length 600 --batch_size 32 
 argp = argparse.ArgumentParser()
 argp.add_argument('--llm_name', default='facebook/opt-125m')
 argp.add_argument('--dataset', default='rechunked_nq')
+argp.add_argument('--user', default='ndc227')
 argp.add_argument('--output_name', default='rechunked_and_scored_nq')
 argp.add_argument('--num_proc', default=1, type=int)
 argp.add_argument('--batch_size', default=2, type=int)
@@ -398,10 +400,10 @@ def score_chunks_batch(batch, rank):
     return batch
 
 if args.tiny:
-    train_chunks = load_dataset(f'ndc227/{args.dataset}', split='train', streaming=True, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets').take(10)
+    train_chunks = load_dataset(f'{args.user}/{args.dataset}', split='train', streaming=True, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets').take(10)
     train_chunks = Dataset.from_generator(lambda: (yield from train_chunks), features=train_chunks.features)
 else:
-    train_chunks = load_dataset(f'ndc227/{args.dataset}', split='train', num_proc=torch.cuda.device_count(), cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
+    train_chunks = load_dataset(f'{args.user}/{args.dataset}', split='train', num_proc=torch.cuda.device_count(), cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
 
 tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
 tokenizer.add_special_tokens({'pad_token': '[PAD]'})
@@ -453,5 +455,5 @@ if __name__ == '__main__':
     print(train_chunks)
     print(len(train_chunks[0]['new_chunks']))
 
-    train_chunks.push_to_hub(f'ndc227/toy_toy_{args.output_name}', private=True)
+    train_chunks.push_to_hub(f'{args.user}/{args.output_name}', private=True)
     print('done uploading to hub')
