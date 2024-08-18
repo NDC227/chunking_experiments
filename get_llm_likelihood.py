@@ -25,6 +25,7 @@ argp.add_argument('--output_name', default='rechunked_and_scored_nq')
 argp.add_argument('--num_proc', default=1, type=int)
 argp.add_argument('--batch_size', default=2, type=int)
 argp.add_argument('--max_seq_length', default=400, type=int)
+argp.add_argument('--split', default='train')
 argp.add_argument('--tiny', action='store_true')
 argp.add_argument('--downsample', default=100, type=int)
 args = argp.parse_args()
@@ -400,10 +401,10 @@ def score_chunks_batch(batch, rank):
     return batch
 
 if args.tiny:
-    train_chunks = load_dataset(f'{args.user}/{args.dataset}', split='train', streaming=True, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets').take(10)
+    train_chunks = load_dataset(f'{args.user}/{args.dataset}', split=args.split, streaming=True, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets').take(3610)
     train_chunks = Dataset.from_generator(lambda: (yield from train_chunks), features=train_chunks.features)
 else:
-    train_chunks = load_dataset(f'{args.user}/{args.dataset}', split='train', num_proc=torch.cuda.device_count(), cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
+    train_chunks = load_dataset(f'{args.user}/{args.dataset}', split=args.split, num_proc=torch.cuda.device_count(), cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
 
 tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
 tokenizer.add_special_tokens({'pad_token': '[PAD]'})

@@ -389,8 +389,20 @@ Answer:""" for i, doc in enumerate(docs)]
                         # quit(0)
                     print([len(docs) for docs in new_docs])
                     # quit(0)                    
+                elif experiment == '3.5':
+                    scores = batch['llm_scores']
+                    scores = torch.stack(scores).T
+                    # print(scores.shape)
+                    # print(np.asarray(scores).shape)
+                    ranking = torch.argsort(torch.tensor(scores), descending=True, axis=1)
+                    # print(ranking)
+                    ranking = ranking[:,:top_k]
+                    # print(ranking)
+                    docs = np.asarray(docs).T
+                    new_docs = np.take_along_axis(docs, ranking.numpy(), axis=1)
+                    # print(new_docs)
+                    # quit(0)
                     
-
                 if rerank:
                     tokenized_questions = self.tokenizer(questions, padding=True, return_tensors='pt').to(device)
                     # tokenized_docs = self.tokenizer([x for retr in docs for x in retr], padding=True, return_tensors='pt').to(device)

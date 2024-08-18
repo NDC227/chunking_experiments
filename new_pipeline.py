@@ -17,6 +17,7 @@ from replug_transformer_new import ReplugTransformer
 # python new_pipeline.py --llm_name facebook/opt-125m --eval --eval_experiment 1.5 --tiny --batch_size 2 --dataset new_chunks_with_retrieve --eval_k 10
 # python new_pipeline.py --llm_name facebook/opt-125m --eval --eval_experiment 2 --tiny --batch_size 1 --dataset test_rechunked --exp2_subset RecursiveCharacterTextSplitter_250_0 --eval_k 10
 # python new_pipeline.py --llm_name facebook/opt-125m --eval --eval_experiment 3 --tiny --batch_size 1 --dataset test_rechunked --eval_k 10
+# python new_pipeline.py --llm_name facebook/opt-125m --eval --eval_experiment 3.5 --tiny --batch_size 2 --dataset toy_rechunked_and_scored_nq --eval_k 10
 argp = argparse.ArgumentParser()
 argp.add_argument('--llm_name', default='facebook/opt-125m')
 argp.add_argument('--train', action='store_true')
@@ -135,6 +136,8 @@ if args.eval:
         eval_dataset.remove_columns('idx')
         # print(eval_dataset, len(eval_dataset[0]['new_chunks']))
         # quit(0)
+    elif args.eval_experiment == '3.5':
+        eval_dataset = load_dataset(f'ndc227/{args.dataset}', split='test', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
     else:
         eval_dataset = load_dataset(f'ndc227/{args.dataset}', split='test', num_proc=num_proc, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
         eval_dataset = eval_dataset.remove_columns('retrieved')
