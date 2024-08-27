@@ -6,10 +6,16 @@ from datasets import load_dataset, Dataset
 import argparse
 from multiprocess import set_start_method
 import os
+from huggingface_hub import HfApi
 
-# python get_llm_likelihood.py --llm_name facebook/opt-125m --dataset rechunked_nq --output_name rechunked_and_scored_nq --tiny --max_seq_length 600 --batch_size 64
-# python get_llm_likelihood.py --llm_name facebook/opt-125m --dataset rechunked_nq --output_name rechunked_and_scored_nq --split test --tiny --max_seq_length 600 --batch_size 64
+# LOCAL USE:
+# python get_llm_likelihood.py --llm_name facebook/opt-125m --dataset rechunked_nq --output_name rechunked_and_scored_nq --split train --tiny --max_seq_length 600 --batch_size 64
+# python get_llm_likelihood.py --llm_name facebook/opt-125m --dataset toy_new_rechunked_nq --output_name rechunked_and_scored_nq --split dev --tiny --max_seq_length 600 --batch_size 64
+# CLUSTER USE:
+# python get_llm_likelihood.py --llm_name meta-llama/Meta-Llama-3.1-8B-Instruct --dataset new_rechunked_nq --output_name rechunked_and_scored_nq --max_seq_length 600 --batch_size 32
+# python get_llm_likelihood.py --llm_name meta-llama/Meta-Llama-3.1-8B-Instruct --dataset new_rechunked_nq --output_name rechunked_and_scored_nq --split dev --max_seq_length 600 --batch_size 32
 # python get_llm_likelihood.py --user ContextualAI --llm_name meta-llama/Meta-Llama-3.1-8B-Instruct --dataset rechunked_nq --output_name rechunked_and_scored_nq --max_seq_length 600 --batch_size 32 
+
 argp = argparse.ArgumentParser()
 argp.add_argument('--llm_name', default='facebook/opt-125m')
 argp.add_argument('--dataset', default='rechunked_nq')
@@ -21,10 +27,11 @@ argp.add_argument('--max_seq_length', default=400, type=int)
 argp.add_argument('--split', default='train')
 argp.add_argument('--tiny', action='store_true')
 argp.add_argument('--downsample', default=100, type=int)
+argp.add_argument('--cache_dir', default='/nlp/scr/ayc227/.cache/huggingface')
 argp.add_argument('--debug', action='store_true')
 args = argp.parse_args()
 
-os.environ['HF_HOME'] = '/nlp/scr/ayc227/.cache/'
+# os.environ['HF_HOME'] = '/nlp/scr/ayc227/.cache/'
 os.environ['HF_TOKEN'] = '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'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -33,6 +40,7 @@ torch.set_float32_matmul_precision('medium')
 num_proc = args.num_proc
 batch_size = args.batch_size
 model_id = args.llm_name
+cache_dir = args.cache_dir
 output_name = args.output_name
 if args.tiny:
     output_name = 'toy_' + output_name
@@ -186,35 +194,6 @@ Answer:''' for i in range(len(docs))]
         torch.cuda.empty_cache()
         return all_scores
 
-def batch_score_chunks(batch, rank):
-    device = f'cuda:{(rank or 0) % torch.cuda.device_count()}'
-    llm.to(device)
-    questions = batch['questions']
-    docs = batch['new_chunks']
-    answers = batch['answers']
-    tokenizer.padding_side = 'right'
-    tokenized_answers = tokenizer(answers, padding=True, return_tensors='pt').to(device)
-    llm_output = batch_llm_pass(questions, docs, tokenized_answers, device)
-    batch['llm_scores'] = llm_output
-    return batch
-
-if args.tiny:
-    train_chunks = load_dataset(f'{args.user}/{args.dataset}', split=args.split, streaming=True, cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets').take(10)
-    train_chunks = Dataset.from_generator(lambda: (yield from train_chunks), features=train_chunks.features)
-else:
-    train_chunks = load_dataset(f'{args.user}/{args.dataset}', split=args.split, num_proc=torch.cuda.device_count(), cache_dir='/nlp/scr/ayc227/.cache/huggingface/datasets')
-
-tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
-tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-
-if model_id.startswith('facebook'):
-    llm = AutoModelForCausalLM.from_pretrained(model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
-else:
-    llm = AutoModelForCausalLM.from_pretrained(model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models', 
-                                               torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2')
-llm.resize_token_embeddings(len(tokenizer))
-llm.eval()
-
 def flatten_chunks(batch, rank):
     idxs = [np.random.choice(len(batch['new_chunks'][i]), size=(args.downsample), replace=False) for i in range(len(batch['new_chunks']))]
     new_batch = {}
@@ -224,31 +203,75 @@ def flatten_chunks(batch, rank):
     new_batch['chunker_ids'] = [chunks[idx] for i, chunks in enumerate(batch['chunker_ids']) for idx in idxs[i]]
     return new_batch
 
+def batch_score_chunks(batch, rank):
+    device = f'cuda:{(rank or 0) % torch.cuda.device_count()}'
+    llm.to(device)
+    llm.eval()
+    questions = batch['questions']
+    docs = batch['new_chunks']
+    answers = batch['answers']
+    tokenizer.padding_side = 'right'
+    tokenized_answers = tokenizer(answers, padding=True, return_tensors='pt').to(device)
+    llm_output = batch_llm_pass(questions, docs, tokenized_answers, device)
+    batch['llm_scores'] = llm_output
+    return batch
+
 def merge_chunks(ex):
     question = ex['questions']
-    filtered_flat_chunks = flat_train_chunks.filter(lambda x: x['questions']==question)
+    filtered_flat_chunks = flat_chunks.filter(lambda x: x['questions']==question)
     ex['new_chunks'] = filtered_flat_chunks['new_chunks']
     ex['chunker_ids'] = filtered_flat_chunks['chunker_ids']
     ex['llm_scores'] = filtered_flat_chunks['llm_scores']
     return ex
 
+if args.tiny:
+    train_chunks = load_dataset(f'{args.user}/{args.dataset}', split=args.split, streaming=True, cache_dir=f'{cache_dir}/datasets').take(10)
+    train_chunks = Dataset.from_generator(lambda: (yield from train_chunks), features=train_chunks.features)
+else:
+    train_chunks = load_dataset(f'{args.user}/{args.dataset}', split=args.split, num_proc=torch.cuda.device_count(), cache_dir=f'{cache_dir}/datasets')
+train_chunks = train_chunks.remove_columns('retrieved')
+
+tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=f'{cache_dir}/models')
+tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+
+# if model_id.startswith('facebook'):
+if True:
+    llm = AutoModelForCausalLM.from_pretrained(model_id, cache_dir=f'{cache_dir}/models')
+else:
+    llm = AutoModelForCausalLM.from_pretrained(model_id, cache_dir=f'{cache_dir}/models', 
+                                               torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2')
+llm.resize_token_embeddings(len(tokenizer))
+llm.eval()
+
 if __name__ == '__main__':
-    set_start_method('spawn')
+    set_start_method('spawn', force=True)
+    # hf_api = HfApi()
+    n_parts = 10
+    n = len(train_chunks)
+    part_size = n // n_parts
+    for i in range(n_parts):
+        try:
+            ds = load_dataset(f'{args.user}/{output_name}', f'part_{i}')
+            print('part exists')
+        except:
+            start = i * part_size
+            end = min((i+1) * part_size, n)
+            print(start, end)
+            chunks = Dataset.from_dict(train_chunks[start:end])
+            print_debug(chunks)
 
-    train_chunks = train_chunks.remove_columns('retrieved')
+            flat_chunks = chunks.map(flatten_chunks, batched=True, batch_size=16, with_rank=True, num_proc=torch.cuda.device_count())
+            print_debug(flat_chunks)
+            print('chunks flattened')
+            
+            flat_chunks = flat_chunks.map(batch_score_chunks, batched=True, batch_size=args.batch_size, with_rank=True, num_proc=torch.cuda.device_count())
+            print_debug(flat_chunks)
+            print('llm scores calculated')
 
-    flat_train_chunks = train_chunks.map(flatten_chunks, batched=True, batch_size=16, with_rank=True, num_proc=torch.cuda.device_count())
-    print_debug(flat_train_chunks)
-    print('chunks flattened')
-    
-    flat_train_chunks = flat_train_chunks.map(batch_score_chunks, batched=True, batch_size=args.batch_size, with_rank=True, num_proc=torch.cuda.device_count())
-    print_debug(flat_train_chunks)
-    print('llm scores calculated')
+            chunks = chunks.map(merge_chunks, num_proc=1)
+            print_debug(chunks)
+            # print_debug('length of first new_chunks', len(train_chunks[0]['new_chunks']))
+            print('llm scores remapped to original dataset')
 
-    train_chunks = train_chunks.map(merge_chunks, num_proc=torch.cuda.device_count())
-    print_debug(train_chunks)
-    print_debug('length of first new_chunks', len(train_chunks[0]['new_chunks']))
-    print('llm scores remapped to original dataset')
-
-    train_chunks.push_to_hub(f'{args.user}/{output_name}', private=True)
-    print('done uploading to hub')
+            chunks.push_to_hub(f'{args.user}/{output_name}', f'part_{i}', private=True)
+            print('done uploading to hub')

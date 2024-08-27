@@ -8,6 +8,7 @@ import lightning as L
 from huggingface_hub import PyTorchModelHubMixin
 import evaluate
 from tqdm import tqdm
+from collections import defaultdict
 
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -32,27 +33,40 @@ class Encoder(nn.Module):
         return x
 
 class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
-    def __init__(self, llm_model):
+    def __init__(self, model_id):
         super().__init__()
-        self.model_id = llm_model
+        self.reranker = AutoModel.from_pretrained('BAAI/bge-m3', cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+        self.reranker_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-m3')
+        self.add_ids = False
+        # self.length_penalty = 0.0
+        self.log_wandb = False
+        self.temperature = 1
+        self.lr = 1e-5
+        self.top_k = 10
+
+        self.model_id = model_id
         self.llm_tokenizer = AutoTokenizer.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
         self.llm_tokenizer.padding_side = 'left'
         self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.vocab_size = len(self.llm_tokenizer)
-        self.reranker = AutoModel.from_pretrained('BAAI/bge-m3', cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
-        self.reranker_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-m3')
-        self.add_ids = False
-        self.length_penalty = 0.0
-        self.log_wandb = False
+        self.llm = None
+        # if self.model_id.startswith('facebook'):
+        #     self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+        # else:
+        #     self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models', 
+        #                                             torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2')
+        # self.llm.resize_token_embeddings(self.vocab_size)
+
+        self.validation_step_outputs = defaultdict(list)
 
     def forward(self, questions, docs):
-        inputs = self.reranker_tokenizer(questions, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+        inputs = self.reranker_tokenizer(questions, padding=True, truncation=True, return_tensors='pt', max_length=400).to(device)
         scores = self.reranker(**inputs, return_dict=True)[0][:, 0]
         query_embeddings = torch.nn.functional.normalize(scores, p=2, dim=1)
         query_embeddings = query_embeddings.unsqueeze(1)
         # print(query_embeddings)
         docs = [d for doc in docs for d in doc]
-        inputs = self.reranker_tokenizer(docs, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+        inputs = self.reranker_tokenizer(docs, padding=True, truncation=True, return_tensors='pt', max_length=400).to(device)
         scores = self.reranker(**inputs, return_dict=True)[0][:, 0]
         doc_embeddings = torch.nn.functional.normalize(scores, p=2, dim=1)
         _, L = doc_embeddings.shape
@@ -62,6 +76,8 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         scores = torch.bmm(query_embeddings, doc_embeddings)
         scores = torch.squeeze(scores)
         # print('scores', scores)
+        del query_embeddings, doc_embeddings, inputs
+        torch.cuda.empty_cache()
         return scores
     
     def expand_data(self, data, batch_size, num_docs):                   # Data: B x S
@@ -70,6 +86,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         return torch.reshape(expanded_data, (batch_size * num_docs, -1)) # BK x S
 
     def training_step(self, batch, batch_idx):
+        self.llm = None
         questions = batch['questions']
         docs = batch['new_chunks']
         # chunker_ids = batch['chunker_ids']
@@ -77,172 +94,279 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         
         self.reranker = self.reranker.to(device)
         self.reranker.train()
-        print(1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+        # print(1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
         # Run an LLM to get the NLLs (logits?)
         with torch.no_grad():
             llm_scores = torch.stack(batch['llm_scores'],dim=1)
-            if self.length_penalty > 0:
-                doc_lengths = torch.tensor([[len(d) for d in doc] for doc in docs]).transpose(0, 1).to(device)
-                print('doc_lengths', doc_lengths.shape)
-                llm_scores = llm_scores - doc_lengths * self.length_penalty
-            llm_dist = torch.nn.functional.softmax(llm_scores, dim=1)
+            # if self.length_penalty > 0:
+            #     doc_lengths = torch.tensor([[len(d) for d in doc] for doc in docs]).transpose(0, 1).to(device)
+            #     print('doc_lengths', doc_lengths.shape)
+            #     llm_scores = llm_scores - doc_lengths * self.length_penalty
+            llm_dist = torch.nn.functional.softmax(llm_scores / self.temperature, dim=1)
             # print('llm_scores', llm_scores.shape)
             # print('llm', llm_dist.shape, llm_dist)
-        print(2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+        # print(2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
         # Normalize the retrieval scores from the forward pass
         reranker_scores = self(questions, docs) # Reranker forward pass
-        reranker_dist = torch.nn.functional.log_softmax(reranker_scores, dim=1)
+        reranker_dist = torch.nn.functional.log_softmax(reranker_scores / self.temperature, dim=1)
         # print('rerank', reranker_dist.shape, reranker_dist)        
-        print(3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+        # print(3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
         # Compute loss = kldiv(scores, nlls)
         lossfn = torch.nn.KLDivLoss(reduction='batchmean')
         loss = lossfn(reranker_dist, llm_dist) # see docs for notation https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
         # print(loss)
+        # quit(0)
         self.log('train_loss', loss.item(), on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=len(questions))
         if self.log_wandb:
             wandb.log({'train_loss': loss.item()})
         del reranker_scores, reranker_dist, llm_scores, llm_dist, lossfn
         torch.cuda.empty_cache()
         return loss
+    
+    def on_train_epoch_end(self):
+        self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+        self.llm.resize_token_embeddings(self.vocab_size)
 
     def configure_optimizers(self):
         params = self.reranker.parameters()
-        return torch.optim.AdamW(params, lr=1e-4)
+        return torch.optim.AdamW(params, lr=self.lr)
 
     def validation_step(self, batch, batch_idx):
-        pass
+        print('validating')
+        self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+        self.llm.resize_token_embeddings(self.vocab_size)
+        with torch.no_grad():
+            questions = batch['questions']
+            docs = batch['new_chunks']
+            # chunker_ids = batch['chunker_ids']
+            answers = batch['answers']
+            
+            self.reranker = self.reranker.to(device)
+            self.reranker.train()
+            # print(1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+
+            # Run an LLM to get the NLLs (logits?)
+            llm_scores = torch.stack(batch['llm_scores'],dim=1)
+            # if self.length_penalty > 0:
+            #     doc_lengths = torch.tensor([[len(d) for d in doc] for doc in docs]).transpose(0, 1).to(device)
+            #     print('doc_lengths', doc_lengths.shape)
+            #     llm_scores = llm_scores - doc_lengths * self.length_penalty
+            llm_dist = torch.nn.functional.softmax(llm_scores / self.temperature, dim=1)
+            # print('llm_scores', llm_scores.shape)
+            # print('llm', llm_dist.shape, llm_dist)
+            # print(2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+
+            # Normalize the retrieval scores from the forward pass
+            reranker_scores = self(questions, docs) # Reranker forward pass
+            reranker_dist = torch.nn.functional.log_softmax(reranker_scores / self.temperature, dim=1)
+            # print('rerank', reranker_dist.shape, reranker_dist)        
+            # print(3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+
+            # Compute loss = kldiv(scores, nlls)
+            lossfn = torch.nn.KLDivLoss(reduction='batchmean')
+            loss = lossfn(reranker_dist, llm_dist) # see docs for notation https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
+            # print(loss)
+            # quit(0)
+            self.log('valid_loss', loss.item(), on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=len(questions))
+            if self.log_wandb:
+                wandb.log({'valid_loss': loss.item()})
+            del reranker_scores, reranker_dist, llm_scores, llm_dist, lossfn
+            torch.cuda.empty_cache()
+            
+            self.llm.to(device)
+            self.llm.eval()
+            self.reranker.to(device)
+            rerank_scores, rerank_order = self.inference(questions, docs, self.top_k)
+            # print('rerank_scores', rerank_scores.shape, rerank_scores)
+            docs = np.asarray(docs).T
+            new_docs = np.take_along_axis(np.asarray(docs), rerank_order.cpu().numpy(), axis=1)
+            del rerank_scores, rerank_order
+            torch.cuda.empty_cache()
+            preds = self.ensemble_predict(questions, new_docs)
+            # em = evaluate.load('exact_match')
+            # em_results = em.compute(predictions=preds, references=answers, ignore_case=True, ignore_punctuation=True)
+            # partial_match_results = self.partial_match(preds, answers)
+            # if self.log_wandb:
+            #     wandb.log({'valid_em': em_results['exact_match']})
+            #     wandb.log({'valid_match': partial_match_results})
+            self.validation_step_outputs['preds'].extend(preds)
+            self.validation_step_outputs['answers'].extend(answers)
+            return loss
+        
+    def on_validation_epoch_end(self):
+        with torch.no_grad():
+            all_preds, all_answers = self.validation_step_outputs['preds'], self.validation_step_outputs['answers']
+            print(all_preds, all_answers)
+            em = evaluate.load('exact_match')
+            em_results = em.compute(predictions=all_preds, references=all_answers, ignore_case=True, ignore_punctuation=True)
+            partial_match_results = self.partial_match(all_preds, all_answers)
+            if self.log_wandb:
+                wandb.log({'valid_em': em_results['exact_match']})
+                wandb.log({'valid_match': partial_match_results})
+            self.validation_step_outputs.clear()  # free memory
+            self.llm = None
 
     def inference(self, questions, docs, top_k):
-        scores = self.forward(questions, docs)
-        order = torch.argsort(scores, descending=True)
-        scores, _ = torch.sort(scores, descending=True)
-        return scores[:,:top_k], order[:,:top_k]
+        with torch.no_grad():
+            scores = self.forward(questions, docs)
+            order = torch.argsort(scores, descending=True)
+            scores, _ = torch.sort(scores, descending=True)
+            return scores[:,:top_k], order[:,:top_k]
     
     def ensemble_predict(self, questions, docs):
-        if self.model_id.startswith('meta-llama'):
-            query = [f'''<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-You are an assistant who gives short, succinct answers to questions. Please answer the following questions using the contexts given below: ''' + \
-'\n'.join(['Context: ' + d for d in doc]) +\
-f'''<|eot_id|>
-
-<|start_header_id|>user<|end_header_id|>
-Question: who was leander paes partner in the mixed doubles at the us open in 2008?<|eot_id|>
-<|start_header_id|>assistant<|end_header_id|>
-Answer: Cara Black<|eot_id|>
-
-<|start_header_id|>user<|end_header_id|>
-Question: who takes over after a president is impeached?<|eot_id|>
-<|start_header_id|>assistant<|end_header_id|>
-Answer: vice president<|eot_id|>
-
-<|start_header_id|>user<|end_header_id|>
-Question: who plays the dogs voice in downward dog?<|eot_id|>
-<|start_header_id|>assistant<|end_header_id|>
-Answer: Samm Hodges<|eot_id|>
-
-<|start_header_id|>user<|end_header_id|>
-Question: when did the name of persia change to iran?<|eot_id|>
-<|start_header_id|>assistant<|end_header_id|>
-Answer: 1935<|eot_id|>
-
-<|start_header_id|>user<|end_header_id|>
-Question: the common name for a modulator demodulator is?<|eot_id|>
-<|start_header_id|>assistant<|end_header_id|>
-Answer: modem<|eot_id|>
-
-<|start_header_id|>user<|end_header_id|>
-Question: what is the term for how steep a line is in math?<|eot_id|>
-<|start_header_id|>assistant<|end_header_id|>
-Answer: slope or gradient<|eot_id|>
-
-<|start_header_id|>user<|end_header_id|>
-Question: how many ep are there in sacred games?<|eot_id|>
-<|start_header_id|>assistant<|end_header_id|>
-Answer: 8<|eot_id|>
-
-<|start_header_id|>user<|end_header_id|>
-Question: neo malthusians believe that the solution to poverty is?<|eot_id|>
-<|start_header_id|>assistant<|end_header_id|>
-Answer: abstinence , delayed marriage<|eot_id|>
-
-<|start_header_id|>user<|end_header_id|>
-Question: {questions[i]}?<|eot_id|>
-<|start_header_id|>assistant<|end_header_id|>
-Answer:''' for i, doc in enumerate(docs)]
-            
-        elif self.model_id.startswith('microsoft'):
-            query = [f'''<|system|>
-You are an assistant who gives short, succinct answers to questions. Please answer the following questions using the contexts given below: ''' + \
-'\n'.join(['Context: ' + d for d in doc]) +\
-f'''<|end|>
-<|user|>
-Question: who was leander paes partner in the mixed doubles at the us open in 2008?<|end|>
-<|assistant|>
-Answer: Cara Black<|end|>
-<|user|>
-Question: who takes over after a president is impeached?<|end|>
-<|assistant|>
-Answer: vice president<|end|>
-<|user|>
-Question: who plays the dogs voice in downward dog?<|end|>
-<|assistant|>
-Answer: Samm Hodges<|end|>
-<|user|>
-Question: when did the name of persia change to iran?<|end|>
-<|assistant|>
-Answer: 1935<|end|>
-<|user|>
-Question: {questions[i]}?<|end|>
-<|assistant|>
-Answer:''' for i, doc in enumerate(docs)]
-            
-        else:
-            query = ['''You are an assistant who gives short, succinct answers to questions. Please answer the following questions using the contexts given below: '''+ \
-'\n'.join(['Context: ' + d for d in doc]) + \
-
-f'''
-Question: who was leander paes partner in the mixed doubles at the us open in 2008?
-Answer: Cara Black
-
-Question: who takes over after a president is impeached?
-Answer: vice president
-
-Question: who plays the dogs voice in downward dog?
-Answer: Samm Hodges
-
-Question: when did the name of persia change to iran?
-Answer: 1935
-
-Question:{questions[i]}?
-Answer:''' for i, doc in enumerate(docs)]
-        tokenized_query = self.llm_tokenizer(query, padding=True, truncation=True, max_length=4000, return_tensors='pt').to(device)
-        print(tokenized_query['input_ids'].shape, tokenized_query['input_ids'])
-        print(torch.max(tokenized_query['input_ids']), torch.min(tokenized_query['input_ids']))
-        print(2.1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
-        outputs = self.llm.generate(**tokenized_query, max_new_tokens=16, tokenizer=self.llm_tokenizer, stop_strings=['\n'])
-        print(2.2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
-        outputs = outputs[:,len(tokenized_query['input_ids'][0]):]
-        # print(outputs.shape)
-        decoded_outputs = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        decoded_outputs = [output.strip() for output in decoded_outputs]
-        # print('decoded_outputs', decoded_outputs)
-        del tokenized_query, outputs
-        torch.cuda.empty_cache()
-        return decoded_outputs
-
-    def evaluate(self, valid_loader, top_k, experiment):
         with torch.no_grad():
+            if self.model_id.startswith('meta-llama'):
+                query = [f'''<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+    You are an assistant who gives short, succinct answers to questions. Please answer the following questions using the contexts given below: 
+    ''' + \
+    '\n'.join(['Context: ' + d for d in doc]) +\
+    f'''<|eot_id|>
+    
+    <|start_header_id|>user<|end_header_id|>
+    Question: who was leander paes partner in the mixed doubles at the us open in 2008?<|eot_id|>
+    <|start_header_id|>assistant<|end_header_id|>
+    Answer: Cara Black<|eot_id|>
+    
+    <|start_header_id|>user<|end_header_id|>
+    Question: who takes over after a president is impeached?<|eot_id|>
+    <|start_header_id|>assistant<|end_header_id|>
+    Answer: vice president<|eot_id|>
+    
+    <|start_header_id|>user<|end_header_id|>
+    Question: who plays the dogs voice in downward dog?<|eot_id|>
+    <|start_header_id|>assistant<|end_header_id|>
+    Answer: Samm Hodges<|eot_id|>
+    
+    <|start_header_id|>user<|end_header_id|>
+    Question: when did the name of persia change to iran?<|eot_id|>
+    <|start_header_id|>assistant<|end_header_id|>
+    Answer: 1935<|eot_id|>
+    
+    <|start_header_id|>user<|end_header_id|>
+    Question: the common name for a modulator demodulator is?<|eot_id|>
+    <|start_header_id|>assistant<|end_header_id|>
+    Answer: modem<|eot_id|>
+    
+    <|start_header_id|>user<|end_header_id|>
+    Question: what is the term for how steep a line is in math?<|eot_id|>
+    <|start_header_id|>assistant<|end_header_id|>
+    Answer: slope or gradient<|eot_id|>
+    
+    <|start_header_id|>user<|end_header_id|>
+    Question: how many ep are there in sacred games?<|eot_id|>
+    <|start_header_id|>assistant<|end_header_id|>
+    Answer: 8<|eot_id|>
+    
+    <|start_header_id|>user<|end_header_id|>
+    Question: neo malthusians believe that the solution to poverty is?<|eot_id|>
+    <|start_header_id|>assistant<|end_header_id|>
+    Answer: abstinence , delayed marriage<|eot_id|>
+    
+    <|start_header_id|>user<|end_header_id|>
+    Question: {questions[i]}?<|eot_id|>
+    <|start_header_id|>assistant<|end_header_id|>
+    Answer:''' for i, doc in enumerate(docs)]
+                
+            elif self.model_id.startswith('microsoft'):
+                query = [f'''<|system|>
+    You are an assistant who gives short, succinct answers to questions. Please answer the following questions using the contexts given below: 
+    ''' + \
+    '\n'.join(['Context: ' + d for d in doc]) +\
+    f'''<|end|>
+    <|user|>
+    Question: who was leander paes partner in the mixed doubles at the us open in 2008?<|end|>
+    <|assistant|>
+    Answer: Cara Black<|end|>
+    <|user|>
+    Question: who takes over after a president is impeached?<|end|>
+    <|assistant|>
+    Answer: vice president<|end|>
+    <|user|>
+    Question: who plays the dogs voice in downward dog?<|end|>
+    <|assistant|>
+    Answer: Samm Hodges<|end|>
+    <|user|>
+    Question: when did the name of persia change to iran?<|end|>
+    <|assistant|>
+    Answer: 1935<|end|>
+    <|user|>
+    Question: {questions[i]}?<|end|>
+    <|assistant|>
+    Answer:''' for i, doc in enumerate(docs)]
+                
+            else:
+                query = ['''You are an assistant who gives short, succinct answers to questions. Please answer the following questions using the contexts given below: 
+    '''+ \
+    '\n'.join(['Context: ' + d for d in doc]) + \
+    
+    f'''
+    
+    Question: who was leander paes partner in the mixed doubles at the us open in 2008?
+    Answer: Cara Black
+    
+    Question: who takes over after a president is impeached?
+    Answer: vice president
+    
+    Question: who plays the dogs voice in downward dog?
+    Answer: Samm Hodges
+    
+    Question: when did the name of persia change to iran?
+    Answer: 1935
+    
+    Question:{questions[i]}?
+    Answer:''' for i, doc in enumerate(docs)]
+            tokenized_query = self.llm_tokenizer(query, padding=True, truncation=True, max_length=4000, return_tensors='pt').to(device)
+            # print(query[0])
+            # print(tokenized_query['input_ids'].shape, tokenized_query['input_ids'])
+            # print(torch.max(tokenized_query['input_ids']), torch.min(tokenized_query['input_ids']))
+            # print(2.1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+            outputs = self.llm.generate(**tokenized_query, max_new_tokens=16, tokenizer=self.llm_tokenizer, stop_strings=['\n'])
+            # print(2.2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+            outputs = outputs[:,len(tokenized_query['input_ids'][0]):]
+            # print(outputs.shape)
+            decoded_outputs = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            decoded_outputs = [output.strip() for output in decoded_outputs]
+            # print('decoded_outputs', decoded_outputs)
+            del tokenized_query, outputs
+            torch.cuda.empty_cache()
+            return decoded_outputs
+
+    def partial_match(self, predictions, answers):
+        n = len(predictions)
+        score = 0
+        for i, prediction in enumerate(predictions):
+            answer = answers[i]
+            prediction = prediction.lower()
+            answer = answer.lower()
+            pred_tokens = prediction.split(' ')
+            ans_tokens = answer.split(' ')
+            pred_length = len(pred_tokens)
+            curr_score = 0
+            for word in pred_tokens:
+                if word in ans_tokens:
+                    curr_score += 1
+            score += curr_score / pred_length
+        return score / n
+
+    def evaluate(self, model_id, valid_loader, top_k, experiment):
+        with torch.no_grad():
+            self.model_id = model_id
             if self.model_id.startswith('facebook'):
                 self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
             else:
                 self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models', 
                                                         torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2')
+            self.llm_tokenizer = AutoTokenizer.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+            self.llm_tokenizer.padding_side = 'left'
+            self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            self.vocab_size = len(self.llm_tokenizer)
             self.llm.resize_token_embeddings(self.vocab_size)
             self.llm.to(device)
             self.llm.eval()
+            
 
             em = evaluate.load('exact_match')
             predictions = []
@@ -292,6 +416,7 @@ Answer:''' for i, doc in enumerate(docs)]
                     new_docs = np.take_along_axis(docs, ranking.numpy(), axis=1)
 
                 elif experiment == '4':
+                    self.reranker.to(device)
                     tokenized_questions = self.llm_tokenizer(questions, padding=True, return_tensors='pt').to(device)
                     if self.add_ids:
                         tokenized_docs = self.llm_tokenizer([chunker_ids[i][j] + ' ' + x for i, retr in enumerate(docs) for j, x in enumerate(retr)], padding=True, return_tensors='pt').to(device)
@@ -300,7 +425,7 @@ Answer:''' for i, doc in enumerate(docs)]
                     tokenized_docs['input_ids'] = torch.transpose(torch.reshape(tokenized_docs['input_ids'], (len(docs), len(docs[0]), -1)), 0, 1)
                     tokenized_docs['attention_mask'] = torch.transpose(torch.reshape(tokenized_docs['attention_mask'], (len(docs), len(docs[0]), -1)), 0, 1)
 
-                    rerank_scores, rerank_order = self.inference(tokenized_questions, tokenized_docs, top_k)
+                    rerank_scores, rerank_order = self.inference(questions, docs, top_k)
                     # print('rerank_scores', rerank_scores.shape, rerank_scores)
                     docs = np.asarray(docs).T
                     new_docs = np.take_along_axis(np.asarray(docs), rerank_order.cpu().numpy(), axis=1)
@@ -313,8 +438,12 @@ Answer:''' for i, doc in enumerate(docs)]
                 print(3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
                 predictions += preds
-                references += [[answer] for answer in answers]
+                # references += [[answer] for answer in answers]
+                references += answers
                 print(preds, answers)
 
-            em_results = em.compute(predictions=predictions, references=list(np.asarray(references).flatten()), ignore_case=True, ignore_punctuation=True)
+            # em_results = em.compute(predictions=predictions, references=list(np.asarray(references).flatten()), ignore_case=True, ignore_punctuation=True)
+            em_results = em.compute(predictions=predictions, references=references, ignore_case=True, ignore_punctuation=True)
+            partial_match_results = self.partial_match(predictions, references)
             print(em_results)
+            print('partial match:', partial_match_results)

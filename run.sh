@@ -14,10 +14,6 @@
 #SBATCH --job-name="sample-1-gpu"
 #SBATCH --output=sample-1-gpu-%j.out
 
-## only use the following if you want email notification (uncomment if needed)
-###SBATCH --mail-user=jimmyw@cs.stanford.edu
-###SBATCH --mail-type=ALL
-
 ## list out some useful information
 echo "SLURM_JOBID="$SLURM_JOBID
 echo "SLURM_JOB_NODELIST"=$SLURM_JOB_NODELIST
