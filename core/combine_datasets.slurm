@@ -15,6 +15,8 @@ ulimit -Sn 20480
 source /env/bin/start-ctx-user
 conda activate andrew-clone
 
+export HF_TOKEN=<hf-token-here>
+
 python combine_datasets.py --user {USER} --dataset split_dev_rechunked --config RecursiveCharacterTextSplitter_500_0 --split dev --output-name combined_dev_rechunked --option 1
 python combine_datasets.py --user {USER} --dataset split_dev_rechunked --config RecursiveCharacterTextSplitter_250_0 --split dev --output-name combined_dev_rechunked --option 1
 python combine_datasets.py --user {USER} --dataset split_dev_rechunked --config ClusterSemanticChunker_500_0 --split dev --output-name combined_dev_rechunked --option 1

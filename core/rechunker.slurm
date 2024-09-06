@@ -20,7 +20,7 @@ conda activate andrew-clone
 
 NODE_INDEX=$SLURM_ARRAY_TASK_ID
 
-###export HF_TOKEN=<hf-token-here>
+export HF_TOKEN=<hf-token-here>
 
 srun --ntasks-per-node=1 --gres=gpu:8 --exclusive bash -c '
 for ((i=0; i<8; i++)); do
