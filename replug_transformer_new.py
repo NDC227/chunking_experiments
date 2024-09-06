@@ -33,9 +33,9 @@ class Encoder(nn.Module):
         return x
 
 class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
-    def __init__(self, model_id):
+    def __init__(self, llm_name):
         super().__init__()
-        self.reranker = AutoModel.from_pretrained('BAAI/bge-m3', cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+        self.reranker = AutoModel.from_pretrained('BAAI/bge-m3')
         self.reranker_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-m3')
         self.add_ids = False
         # self.length_penalty = 0.0
@@ -44,18 +44,19 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         self.lr = 1e-5
         self.top_k = 10
 
-        self.model_id = model_id
-        self.llm_tokenizer = AutoTokenizer.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+        self.llm_name = llm_name
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(self.llm_name)
         self.llm_tokenizer.padding_side = 'left'
         self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.vocab_size = len(self.llm_tokenizer)
-        self.llm = None
-        # if self.model_id.startswith('facebook'):
-        #     self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
-        # else:
-        #     self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models', 
-        #                                             torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2')
-        # self.llm.resize_token_embeddings(self.vocab_size)
+        # self.llm = None
+        #if self.llm_name.startswith('facebook'):
+        if True:
+            self.llm = AutoModelForCausalLM.from_pretrained(self.llm_name)
+        else:
+            self.llm = AutoModelForCausalLM.from_pretrained(self.llm_name, 
+                                                    torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2')
+        self.llm.resize_token_embeddings(self.vocab_size)
 
         self.validation_step_outputs = defaultdict(list)
 
@@ -86,7 +87,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         return torch.reshape(expanded_data, (batch_size * num_docs, -1)) # BK x S
 
     def training_step(self, batch, batch_idx):
-        self.llm = None
+        # self.llm = None
         questions = batch['questions']
         docs = batch['new_chunks']
         # chunker_ids = batch['chunker_ids']
@@ -94,7 +95,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         
         self.reranker = self.reranker.to(device)
         self.reranker.train()
-        # print(1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+        print(1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
         # Run an LLM to get the NLLs (logits?)
         with torch.no_grad():
@@ -106,13 +107,13 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
             llm_dist = torch.nn.functional.softmax(llm_scores / self.temperature, dim=1)
             # print('llm_scores', llm_scores.shape)
             # print('llm', llm_dist.shape, llm_dist)
-        # print(2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+        print(2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
         # Normalize the retrieval scores from the forward pass
         reranker_scores = self(questions, docs) # Reranker forward pass
         reranker_dist = torch.nn.functional.log_softmax(reranker_scores / self.temperature, dim=1)
         # print('rerank', reranker_dist.shape, reranker_dist)        
-        # print(3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+        print(3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
         # Compute loss = kldiv(scores, nlls)
         lossfn = torch.nn.KLDivLoss(reduction='batchmean')
@@ -126,18 +127,18 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
         torch.cuda.empty_cache()
         return loss
     
-    def on_train_epoch_end(self):
-        self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
-        self.llm.resize_token_embeddings(self.vocab_size)
+    # def on_train_epoch_end(self):
+    #     self.llm = AutoModelForCausalLM.from_pretrained(self.llm_name)
+    #     self.llm.resize_token_embeddings(self.vocab_size)
 
     def configure_optimizers(self):
         params = self.reranker.parameters()
         return torch.optim.AdamW(params, lr=self.lr)
 
     def validation_step(self, batch, batch_idx):
-        print('validating')
-        self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
-        self.llm.resize_token_embeddings(self.vocab_size)
+        # print('validating')
+        # self.llm = AutoModelForCausalLM.from_pretrained(self.llm_name)
+        # self.llm.resize_token_embeddings(self.vocab_size)
         with torch.no_grad():
             questions = batch['questions']
             docs = batch['new_chunks']
@@ -199,7 +200,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
     def on_validation_epoch_end(self):
         with torch.no_grad():
             all_preds, all_answers = self.validation_step_outputs['preds'], self.validation_step_outputs['answers']
-            print(all_preds, all_answers)
+            # print(all_preds, all_answers)
             em = evaluate.load('exact_match')
             em_results = em.compute(predictions=all_preds, references=all_answers, ignore_case=True, ignore_punctuation=True)
             partial_match_results = self.partial_match(all_preds, all_answers)
@@ -207,7 +208,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
                 wandb.log({'valid_em': em_results['exact_match']})
                 wandb.log({'valid_match': partial_match_results})
             self.validation_step_outputs.clear()  # free memory
-            self.llm = None
+            # self.llm = None
 
     def inference(self, questions, docs, top_k):
         with torch.no_grad():
@@ -218,7 +219,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
     
     def ensemble_predict(self, questions, docs):
         with torch.no_grad():
-            if self.model_id.startswith('meta-llama'):
+            if self.llm_name.startswith('meta-llama'):
                 query = [f'''<|begin_of_text|><|start_header_id|>system<|end_header_id|>
     You are an assistant who gives short, succinct answers to questions. Please answer the following questions using the contexts given below: 
     ''' + \
@@ -270,7 +271,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
     <|start_header_id|>assistant<|end_header_id|>
     Answer:''' for i, doc in enumerate(docs)]
                 
-            elif self.model_id.startswith('microsoft'):
+            elif self.llm_name.startswith('microsoft'):
                 query = [f'''<|system|>
     You are an assistant who gives short, succinct answers to questions. Please answer the following questions using the contexts given below: 
     ''' + \
@@ -351,15 +352,16 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
             score += curr_score / pred_length
         return score / n
 
-    def evaluate(self, model_id, valid_loader, top_k, experiment):
+    def evaluate(self, llm_name, valid_loader, top_k, experiment):
         with torch.no_grad():
-            self.model_id = model_id
-            if self.model_id.startswith('facebook'):
-                self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+            self.llm_name = llm_name
+            # if self.llm_name.startswith('facebook'):
+            if True:
+                self.llm = AutoModelForCausalLM.from_pretrained(self.llm_name)
             else:
-                self.llm = AutoModelForCausalLM.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models', 
+                self.llm = AutoModelForCausalLM.from_pretrained(self.llm_name, 
                                                         torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2')
-            self.llm_tokenizer = AutoTokenizer.from_pretrained(self.model_id, cache_dir='/nlp/scr/ayc227/.cache/huggingface/models')
+            self.llm_tokenizer = AutoTokenizer.from_pretrained(self.llm_name)
             self.llm_tokenizer.padding_side = 'left'
             self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
             self.vocab_size = len(self.llm_tokenizer)
@@ -373,7 +375,7 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
             references = []
             
             for batch in tqdm(valid_loader):
-                print(1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+                # print(1, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
                 questions = batch['questions']
                 if experiment == '1' or experiment == '1.5':
                     docs = batch['retrieved']
@@ -432,18 +434,21 @@ class ReplugTransformer(L.LightningModule, PyTorchModelHubMixin):
                     del tokenized_questions, tokenized_docs, rerank_scores, rerank_order
                     torch.cuda.empty_cache()
                     
-                print(2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+                # print(2, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
                 preds = self.ensemble_predict(questions, new_docs)
-                print(3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+                # print(3, torch.cuda.mem_get_info(), torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
 
                 predictions += preds
                 # references += [[answer] for answer in answers]
                 references += answers
-                print(preds, answers)
+                # print(preds, answers)
 
             # em_results = em.compute(predictions=predictions, references=list(np.asarray(references).flatten()), ignore_case=True, ignore_punctuation=True)
             em_results = em.compute(predictions=predictions, references=references, ignore_case=True, ignore_punctuation=True)
             partial_match_results = self.partial_match(predictions, references)
             print(em_results)
             print('partial match:', partial_match_results)
+            results = {"Exact Match": em_results["exact_match"],
+                       "Partial Match": partial_match_results}
+            return results
